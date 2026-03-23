@@ -11,3 +11,5 @@ build/
 .vscode/
 .claude/
 .vscode/
+bot.log
+trade_log.json

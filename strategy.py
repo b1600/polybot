@@ -2,9 +2,10 @@
 import math
 
 class MispricingStrategy:
-    def __init__(self, kelly_fraction=0.5, min_edge=0.03, min_bet=1.0):
+    def __init__(self, kelly_fraction=0.5, min_edge=0.03, max_edge=0.08, min_bet=1.0):
         self.kelly_fraction = kelly_fraction  # half-Kelly recommended
         self.min_edge = min_edge              # minimum edge to trade (3%)
+        self.max_edge = max_edge              # maximum edge to trade (8%) — above this likely a data error
         self.min_bet = min_bet
 
     def estimate_true_probability(self, window_delta, momentum, seconds_remaining):
@@ -106,7 +107,7 @@ class MispricingStrategy:
         # Check "Up" side
         up_price = market["Up"]["price"]
         up_edge = prob_up - up_price
-        if up_edge > self.min_edge:
+        if self.min_edge < up_edge <= self.max_edge:
             kelly = self.calculate_kelly(prob_up, up_price)
             candidates.append({
                 "side": "Up",
@@ -120,7 +121,7 @@ class MispricingStrategy:
         # Check "Down" side
         down_price = market["Down"]["price"]
         down_edge = prob_down - down_price
-        if down_edge > self.min_edge:
+        if self.min_edge < down_edge <= self.max_edge:
             kelly = self.calculate_kelly(prob_down, down_price)
             candidates.append({
                 "side": "Down",
