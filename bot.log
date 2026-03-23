@@ -1,0 +1,4 @@
+2026-03-23 14:52:45,215 | Bot started | Bankroll: $100.00 | Dry run: True
+2026-03-23 14:52:48,652 | Waiting 72s until T-60 for window 1774252200
+2026-03-23 14:54:00,831 | Window 1774252200 | No mispricing found | Up=0.45 Down=0.56 | BTC delta=0.000%
+2026-03-23 14:55:01,833 | Waiting 239s until T-60 for window 1774252500

@@ -1,0 +1,18 @@
+[
+  {
+    "timestamp": "2026-03-23T07:34:00.467201",
+    "window": 1774251000,
+    "slug": "btc-updown-5m-1774251000",
+    "side": "Down",
+    "token_id": "24519607896957440367686998587241772852825079140760909700563561559677574125850",
+    "price": 0.455,
+    "bet_amount": 4.73,
+    "shares": 10.4,
+    "edge": 0.0515,
+    "net_edge_after_taker_fee": 0.0361,
+    "kelly_pct": 0.0473,
+    "estimated_prob": 0.5065,
+    "use_maker": false,
+    "bankroll_before": 100.0
+  }
+]

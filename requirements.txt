@@ -1,0 +1,5 @@
+py-clob-client==0.34.6
+websockets
+requests
+python-dotenv
+web3
