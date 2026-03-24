@@ -3,3 +3,4 @@ websockets
 requests
 python-dotenv
 web3
+boto3
