@@ -48,9 +48,16 @@ from executor import (
 )
 
 load_dotenv()
+
+_formatter = logging.Formatter("%(asctime)s | %(message)s")
+_file_handler = logging.FileHandler("bot.log")
+_file_handler.setFormatter(_formatter)
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(_formatter)
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(message)s",
+    handlers=[_file_handler, _console_handler],
 )
 log = logging.getLogger("bot")
 
