@@ -28,6 +28,8 @@ import asyncio
 import time
 import json
 import logging
+import threading
+import requests
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 import os
@@ -49,15 +51,64 @@ from executor import (
 
 load_dotenv()
 
+
+class TelegramHandler(logging.Handler):
+    """
+    Logging handler that sends log records to a Telegram chat.
+    Runs each send in a daemon thread so it never blocks the bot loop.
+    Call flush() before process exit to wait for any in-flight sends.
+    Silently drops messages if credentials are missing or the API call fails.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.token = os.getenv("TELEGRAM_BOT_TOKEN")
+        self.chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        self._url = (
+            f"https://api.telegram.org/bot{self.token}/sendMessage"
+            if self.token else None
+        )
+        self._pending: list[threading.Thread] = []
+        self._lock = threading.Lock()
+
+    def emit(self, record: logging.LogRecord):
+        if not self._url or not self.chat_id:
+            return
+        text = self.format(record)
+        t = threading.Thread(target=self._send, args=(text,), daemon=True)
+        with self._lock:
+            self._pending.append(t)
+        t.start()
+
+    def flush(self):
+        """Block until all queued Telegram sends have completed."""
+        with self._lock:
+            threads, self._pending = list(self._pending), []
+        for t in threads:
+            t.join(timeout=10)
+
+    def _send(self, text: str):
+        try:
+            requests.post(
+                self._url,
+                json={"chat_id": self.chat_id, "text": text},
+                timeout=5,
+            )
+        except Exception:
+            pass  # never let Telegram errors crash the bot
+
+
 _formatter = logging.Formatter("%(asctime)s | %(message)s")
 _file_handler = logging.FileHandler("bot.log")
 _file_handler.setFormatter(_formatter)
 _console_handler = logging.StreamHandler()
 _console_handler.setFormatter(_formatter)
+_telegram_handler = TelegramHandler()
+_telegram_handler.setFormatter(_formatter)
 
 logging.basicConfig(
     level=logging.INFO,
-    handlers=[_file_handler, _console_handler],
+    handlers=[_file_handler, _console_handler, _telegram_handler],
 )
 log = logging.getLogger("bot")
 
@@ -582,6 +633,7 @@ async def main():
         await bot.price_feed.stop()
         bot.print_session_stats()
         bot.save_log()
+        _telegram_handler.flush()  # ensure session stats reach Telegram before exit
 
 
 if __name__ == "__main__":
