@@ -324,6 +324,10 @@ class TradingBot:
             )
 
             if phase == "mm" and not self.window.mm_placed:
+                log.info(
+                    f"MM-EVAL | Up: {market['Up']['price']:.4f} | "
+                    f"Down: {market['Down']['price']:.4f}"
+                )
                 await self._execute_mm(result)
 
             elif phase == "fade" and not self.window.fade_fired:
