@@ -1,24 +1,26 @@
 # executor.py
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType
+from py_clob_client.clob_types import ApiCreds, OrderArgs, MarketOrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY
 from dotenv import load_dotenv
 import os
 
 load_dotenv()
 
-def create_client():
-    return ClobClient(
+def init_client():
+    creds = ApiCreds(
+        api_key=os.getenv("POLY_API_KEY"),
+        api_secret=os.getenv("POLY_API_SECRET"),
+        api_passphrase=os.getenv("POLY_API_PASSPHRASE"),
+    )
+    client = ClobClient(
         host=os.getenv("CLOB_HOST"),
         key=os.getenv("POLY_PRIVATE_KEY"),
         chain_id=137,
         signature_type=int(os.getenv("POLY_SIGNATURE_TYPE", "0")),
         funder=os.getenv("POLY_FUNDER_ADDRESS"),
+        creds=creds,
     )
-
-def init_client():
-    client = create_client()
-    client.set_api_creds(client.create_or_derive_api_creds())
     return client
 
 def place_maker_order(client, token_id, price, size):
