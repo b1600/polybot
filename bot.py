@@ -1,27 +1,12 @@
 # bot.py — v2 multi-phase trading loop
 #
-# KEY CHANGES FROM v1:
-# ─────────────────────────────────────────────────────────
-# v1: Evaluate ONCE at T-60. One shot, one strategy.
-# v2: Evaluate CONTINUOUSLY throughout each window on a 5s tick.
-#     Three strategies fire at different phases:
-#       T-240 → T-30:  Market making (two-sided quotes)
-#       T-180 → T-30:  Fade extreme spikes (opportunistic)
-#       T-15  → T-3:   Late-window directional scalp
+# Three all-taker strategies fire at different phases:
+#   T-120 → T-30:  Early momentum (directional, taker)
+#   T-180 → T-30:  Fade extreme spikes (opportunistic, taker)
+#   T-15  → T-3:   Late-window directional scalp (taker)
 #
-# v1: Single trade per window, sleep until resolution.
-# v2: MM orders go out early + get monitored for fills.
-#     If one side fills, the other is cancelled immediately.
-#     A late scalp can STILL fire even if MM is already active.
-#
-# v1: No order tracking. Fire and forget.
-# v2: Tracks open order IDs per window. Cancels stale orders
-#     at window boundaries. Knows which side filled.
-#
-# v1: Bankroll only updates after resolution.
-# v2: Bankroll tracks committed capital (open orders reduce
-#     available bankroll to prevent over-betting).
-#
+# All strategies use taker (market) orders — no maker orders,
+# no cancel-after-fill dependency.
 # ─────────────────────────────────────────────────────────
 
 import asyncio
@@ -43,10 +28,9 @@ from price_feed import BinancePriceFeed
 from strategy_v2 import CombinedStrategy
 from executor import (
     init_client,
-    place_maker_order,
     place_market_order,
-    cancel_order,
     cancel_all,
+    get_usdc_balance,
 )
 
 load_dotenv()
@@ -116,8 +100,7 @@ log = logging.getLogger("bot")
 
 EVAL_INTERVAL = 5       # seconds between strategy evaluations within a window
 RESOLUTION_WAIT = 6     # seconds after window close before checking outcome
-MM_CANCEL_BUFFER = 20   # cancel unfilled MM orders this many seconds before close
-MAX_TRADES_PER_WINDOW = 3  # hard cap: 1 MM pair + 1 fade/scalp
+MAX_TRADES_PER_WINDOW = 3  # hard cap: at most one of each strategy per window
 DAILY_LOSS_LIMIT_PCT = 0.25  # stop trading if down 25% from session start
 
 
@@ -132,15 +115,15 @@ class WindowState:
         self.slug = build_slug(window_start)
         self.window_end = window_start + 300
 
+        # BTC prices for direct resolution (avoids Polymarket settlement lag)
+        self.btc_open_price: float | None = None
+        self.btc_close_price: float | None = None
+
         # Order tracking
-        self.mm_order_ids: dict[str, str] = {}  # side → order_id
-        self.mm_fill_side: str | None = None     # which MM side filled
-        self.directional_trade: dict | None = None
         self.trades: list[dict] = []
 
         # Flags
-        self.mm_placed = False
-        self.mm_cancelled = False
+        self.momentum_fired = False
         self.scalp_fired = False
         self.fade_fired = False
 
@@ -161,11 +144,14 @@ class WindowState:
 class TradingBot:
     def __init__(self, dry_run: bool = False):
         self.dry_run = dry_run
-        self.bankroll = float(os.getenv("STARTING_BANKROLL", 100.0))
-        self.session_start_bankroll = self.bankroll
-        self.strategy = CombinedStrategy()
-        self.price_feed = BinancePriceFeed()
         self.client = None if dry_run else init_client()
+        if dry_run:
+            self.bankroll = float(os.getenv("STARTING_BANKROLL", 100.0))
+        else:
+            self.bankroll = get_usdc_balance(self.client)
+        self.session_start_bankroll = self.bankroll
+        self.strategy = CombinedStrategy(dry_run=dry_run)
+        self.price_feed = BinancePriceFeed()
         self.trade_log: list[dict] = []
         self.window: WindowState | None = None
 
@@ -246,8 +232,12 @@ class TradingBot:
             await asyncio.sleep(5)
             return
 
+        # ── Sync bankroll from CLOB before placing any orders ─
+        await self._refresh_bankroll()
+
         # ── Initialize window state ────────────────────────
         self.window = WindowState(window_start)
+        self.window.btc_open_price = self.price_feed.window_open_price
         self.strategy.on_new_window()
         self.total_windows += 1
 
@@ -272,8 +262,14 @@ class TradingBot:
         else:
             await asyncio.sleep(RESOLUTION_WAIT)
 
+        # Capture BTC close price (current price ~6s after window end)
+        self.window.btc_close_price = self.price_feed.current_price
+
         # ── Check outcomes for all trades this window ──────
         await self._resolve_window()
+
+        # ── Re-sync bankroll: catches fills missed by model ─
+        await self._refresh_bankroll()
 
         # ── Log summary ────────────────────────────────────
         self._log_window_summary()
@@ -298,14 +294,6 @@ class TradingBot:
                 await asyncio.sleep(seconds_remaining)
                 break
 
-            # Cancel MM orders before window close if unfilled
-            if (
-                self.window.mm_placed
-                and not self.window.mm_cancelled
-                and seconds_remaining < MM_CANCEL_BUFFER
-            ):
-                await self._cancel_mm_orders("approaching window close")
-
             # Fetch fresh market data
             market = self._fetch_market_safe()
             if market is None:
@@ -323,21 +311,15 @@ class TradingBot:
                 market, available, self.price_feed, seconds_remaining
             )
 
-            if phase == "mm" and not self.window.mm_placed:
-                log.info(
-                    f"MM-EVAL | Up: {market['Up']['price']:.4f} | "
-                    f"Down: {market['Down']['price']:.4f}"
-                )
-                await self._execute_mm(result)
+            if phase == "momentum" and not self.window.momentum_fired:
+                await self._execute_directional(result, "MOMENTUM")
+                self.window.momentum_fired = True
 
             elif phase == "fade" and not self.window.fade_fired:
                 await self._execute_directional(result, "FADE")
                 self.window.fade_fired = True
 
             elif phase == "scalp" and not self.window.scalp_fired:
-                # Cancel any remaining MM orders before scalping
-                if self.window.mm_placed and not self.window.mm_cancelled:
-                    await self._cancel_mm_orders("scalp taking over")
                 await self._execute_directional(result, "SCALP")
                 self.window.scalp_fired = True
 
@@ -345,79 +327,7 @@ class TradingBot:
             sleep_time = min(EVAL_INTERVAL, max(1, seconds_remaining - 3))
             await asyncio.sleep(sleep_time)
 
-    # ── Execution: Market Making ───────────────────────────
-
-    async def _execute_mm(self, orders: list[dict]):
-        """
-        Place two-sided maker orders (buy Up + buy Down).
-        Track order IDs so we can cancel the opposite side on fill.
-        """
-        self.window.mm_placed = True
-
-        for order in orders:
-            side = order["side"]
-            log.info(
-                f"MM-POST | {side} @ ${order['price']:.2f} | "
-                f"Shares: {order['shares']} | "
-                f"Amount: ${order['bet_amount']:.2f}"
-            )
-
-            order_id = None
-            if not self.dry_run:
-                try:
-                    resp = place_maker_order(
-                        self.client,
-                        order["token_id"],
-                        order["price"],
-                        order["shares"],
-                    )
-                    order_id = resp.get("orderID") or resp.get("id")
-                    log.info(f"MM-POST | {side} order ID: {order_id}")
-                except Exception as e:
-                    log.error(f"MM-POST | {side} order failed: {e}")
-                    continue
-
-            # Track the order
-            trade_record = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "window": self.window.window_start,
-                "slug": self.window.slug,
-                "order_id": order_id,
-                "status": "open",
-                **order,
-                "bankroll_before": self.bankroll,
-            }
-            self.window.trades.append(trade_record)
-            self.trade_log.append(trade_record)
-
-            if order_id:
-                self.window.mm_order_ids[side] = order_id
-
-    async def _cancel_mm_orders(self, reason: str):
-        """Cancel all resting MM orders for this window."""
-        self.window.mm_cancelled = True
-        if self.dry_run:
-            log.info(f"MM-CANCEL | (dry run) reason: {reason}")
-            for t in self.window.trades:
-                if t.get("strategy") == "mm" and t.get("status") == "open":
-                    t["status"] = "cancelled"
-            return
-
-        for side, order_id in self.window.mm_order_ids.items():
-            try:
-                cancel_order(self.client, order_id)
-                log.info(
-                    f"MM-CANCEL | {side} order {order_id} | {reason}"
-                )
-            except Exception as e:
-                log.error(f"MM-CANCEL | {side} failed: {e}")
-
-        # Update trade records
-        for t in self.window.trades:
-            if t.get("strategy") == "mm" and t.get("status") == "open":
-                t["status"] = "cancelled"
-
-    # ── Execution: Directional (Scalp / Fade) ──────────────
+    # ── Execution: Directional (Momentum / Fade / Scalp) ──────────────
 
     async def _execute_directional(self, trade: dict, label: str):
         """Execute a single directional trade (scalp or fade)."""
@@ -431,19 +341,11 @@ class TradingBot:
         order_id = None
         if not self.dry_run:
             try:
-                if trade.get("use_maker"):
-                    resp = place_maker_order(
-                        self.client,
-                        trade["token_id"],
-                        trade["price"],
-                        trade["shares"],
-                    )
-                else:
-                    resp = place_market_order(
-                        self.client,
-                        trade["token_id"],
-                        trade["bet_amount"],
-                    )
+                resp = place_market_order(
+                    self.client,
+                    trade["token_id"],
+                    trade["bet_amount"],
+                )
                 order_id = resp.get("orderID") or resp.get("id")
                 log.info(f"{label} | Order ID: {order_id}")
             except Exception as e:
@@ -465,14 +367,7 @@ class TradingBot:
     # ── End-of-window cleanup ──────────────────────────────
 
     async def _cleanup_window(self):
-        """
-        Cancel any resting orders that didn't fill before
-        the window closes.
-        """
-        if self.window.mm_placed and not self.window.mm_cancelled:
-            await self._cancel_mm_orders("window closing")
-
-        # In live mode, also cancel_all as a safety net
+        """Safety cancel_all sweep at window close (live mode only)."""
         if not self.dry_run and self.client:
             try:
                 cancel_all(self.client)
@@ -483,35 +378,41 @@ class TradingBot:
 
     async def _resolve_window(self):
         """
-        Check the resolved market to determine win/loss for
-        each trade placed this window.
-
-        In production, you'd poll the CLOB or listen to the
-        WebSocket for fill confirmations and market resolution.
-        For dry-run and simplicity, we use the Gamma API price
-        after resolution.
+        Determine win/loss for each trade using the actual BTC price change.
+        Compares btc_open_price (captured at window start) against
+        btc_close_price (captured ~6s after window end from the live feed).
+        This avoids Polymarket token settlement lag which caused
+        "Resolution unclear" false-negatives.
         """
         if not self.window or not self.window.trades:
             return
 
-        market = self._fetch_market_safe()
-        if not market:
-            log.error(
-                f"Could not fetch resolved market for "
-                f"window {self.window.window_start}"
-            )
-            return
+        btc_open = self.window.btc_open_price
+        btc_close = self.window.btc_close_price
 
-        up_price = market.get("Up", {}).get("price", 0.5)
-        # After resolution: winning side → ~$1.00, losing → ~$0.00
-        winning_side = "Up" if up_price > 0.90 else "Down" if up_price < 0.10 else None
-
-        if winning_side is None:
+        if not btc_open or not btc_close:
             log.warning(
                 f"Window {self.window.window_start} | "
-                f"Resolution unclear (Up={up_price:.2f}). Skipping P&L."
+                f"BTC prices unavailable for resolution. Skipping P&L."
             )
             return
+
+        if btc_close > btc_open:
+            winning_side = "Up"
+        elif btc_close < btc_open:
+            winning_side = "Down"
+        else:
+            log.warning(
+                f"Window {self.window.window_start} | "
+                f"BTC open == close (${btc_open:,.2f}). No clear winner."
+            )
+            return
+
+        log.info(
+            f"Window {self.window.window_start} | "
+            f"BTC: ${btc_open:,.2f} → ${btc_close:,.2f} | "
+            f"Winner: {winning_side}"
+        )
 
         for trade in self.window.trades:
             # Skip cancelled orders — no P&L
@@ -548,6 +449,30 @@ class TradingBot:
             trade["status"] = "resolved"
             trade["bankroll_after"] = round(self.bankroll, 2)
             self.total_trades += 1
+
+    # ── Bankroll sync ──────────────────────────────────────
+
+    async def _refresh_bankroll(self):
+        """Sync self.bankroll with the actual CLOB balance.
+
+        Called at the start of every window and after resolution so that
+        any orders filled before cancellation (or positions settled by
+        Polymarket between sessions) are reflected in our capital tracking.
+        Skipped in dry-run mode.
+        """
+        if self.dry_run:
+            return
+        try:
+            actual = get_usdc_balance(self.client)
+            if abs(actual - self.bankroll) > 0.01:
+                log.info(
+                    f"Bankroll sync: model=${self.bankroll:.2f} → "
+                    f"actual=${actual:.2f} "
+                    f"(drift=${actual - self.bankroll:+.2f})"
+                )
+            self.bankroll = actual
+        except Exception as e:
+            log.error(f"Bankroll refresh failed: {e}")
 
     # ── Helpers ────────────────────────────────────────────
 
