@@ -11,7 +11,7 @@
 #    Buy the cheap side when market price is extreme (>0.85) AND
 #    the move looks like a spike (5s vol >> 60s vol). Taker order.
 #
-# C) Late-Window Scalp (T-15 to T-3):
+# C) Late-Window Scalp (T-30 to T-3):
 #    Directional taker bet when delta >0.15% and very little time
 #    remains for a reversal. Quarter-Kelly, guaranteed fill.
 #
@@ -224,7 +224,7 @@ class FadeExtremeStrategy:
 # The ONLY time retail can reliably predict direction is in the
 # very last seconds of a window, when:
 #   1. BTC delta is large (>0.15%) AND
-#   2. Time remaining is tiny (<15s) AND
+#   2. Time remaining is small (<30s) AND
 #   3. The Polymarket price hasn't fully caught up
 #
 # This is rare. The bot should trigger on maybe 5-10% of windows.
@@ -232,7 +232,7 @@ class FadeExtremeStrategy:
 
 class LateScalpStrategy:
     """
-    Bet direction only in the last 15 seconds when delta is extreme.
+    Bet direction only in the last 30 seconds when delta is extreme.
     """
 
     def __init__(
@@ -242,7 +242,7 @@ class LateScalpStrategy:
         min_edge: float = 0.05,           # need 5% edge minimum
         min_bet: float = 1.0,
         max_bet_pct: float = 0.10,        # max 10% of bankroll
-        entry_window_seconds: int = 15,   # only act in last 15s
+        entry_window_seconds: int = 30,   # only act in last 30s
     ):
         self.min_delta_pct = min_delta_pct
         self.kelly_fraction = kelly_fraction
@@ -348,7 +348,7 @@ class CombinedStrategy:
         Called multiple times per window. Returns:
         - ("momentum", trade)  — early directional bet (T-120 to T-30)
         - ("fade", trade)      — fade a spike (T-180 to T-30)
-        - ("scalp", trade)     — directional bet (last 15s)
+        - ("scalp", trade)     — directional bet (last 30s)
         - ("skip", None)       — do nothing this phase
         """
         # Phase 1: Early momentum (T-120 to T-30)
@@ -368,8 +368,8 @@ class CombinedStrategy:
             if trade:
                 return ("fade", trade)
 
-        # Phase 3: Late scalp (last 15s)
-        if seconds_remaining <= 15:
+        # Phase 3: Late scalp (last 30s)
+        if seconds_remaining <= 30:
             trade = self.scalp.evaluate(
                 market, bankroll, price_feed, seconds_remaining
             )
