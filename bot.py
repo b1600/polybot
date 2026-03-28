@@ -28,6 +28,7 @@ from strategy_v2 import CombinedStrategy
 from executor import (
     init_client,
     place_market_order,
+    get_ask_depth,
     cancel_all,
     get_usdc_balance,
 )
@@ -331,8 +332,13 @@ class TradingBot:
     async def _execute_directional(self, trade: dict, label: str):
         """Execute a single directional trade (scalp or fade).
 
-        For SCALP: retries up to SCALP_MAX_RETRIES times with FOK on "no match".
-        Non-SCALP labels fail fast.
+        For SCALP:
+        - Pre-checks order book; aborts immediately if asks are empty (suggestion 1).
+        - Uses FAK (Fill-and-Kill = IOC) to accept partial fills (suggestion 4).
+        - Retries up to SCALP_MAX_RETRIES times, walking up the price cap by
+          SCALP_PRICE_STEP each attempt so a higher ask can be hit (suggestion 2).
+        - Waits 1s between retries to let the book refill (suggestion 6).
+        Non-SCALP labels use a single FAK attempt with no price cap (price=0).
         """
         log.info(
             f"{label} | {trade['side']} @ ${trade['price']:.2f} | "
@@ -342,30 +348,58 @@ class TradingBot:
         )
 
         SCALP_MAX_RETRIES = 2
+        SCALP_PRICE_STEP = 0.01  # walk up 1 tick per retry
 
         order_id = None
         if not self.dry_run:
             max_attempts = (SCALP_MAX_RETRIES + 1) if label == "SCALP" else 1
+
+            # Suggestion 1: pre-check order book depth before any attempt.
+            # If asks are empty the SDK will raise "no match" every time —
+            # skip all retries and save ~0.9s of wasted round-trips.
+            if label == "SCALP":
+                asks = get_ask_depth(self.client, trade["token_id"])
+                if not asks:
+                    log.warning(f"{label} | Order book empty — skipping")
+                    return
+
             for attempt in range(max_attempts):
+                # Suggestion 2: walk up price cap each retry.
+                # attempt 0 → base price, attempt 1 → +0.01, attempt 2 → +0.02
+                price_cap = (
+                    round(trade["price"] + attempt * SCALP_PRICE_STEP, 2)
+                    if label == "SCALP" else 0
+                )
+
+                if attempt > 0:
+                    log.warning(
+                        f"{label} | no match — retry {attempt} (FAK @ ${price_cap:.2f})"
+                    )
+                    # Suggestion 6: wait 1s between retries so market makers
+                    # have time to repost asks before the next attempt.
+                    await asyncio.sleep(1)
+
                 try:
-                    if attempt == 0:
-                        resp = place_market_order(
-                            self.client,
-                            trade["token_id"],
-                            trade["bet_amount"],
+                    resp = place_market_order(
+                        self.client,
+                        trade["token_id"],
+                        trade["bet_amount"],
+                        price=price_cap,
+                    )
+                    order_id = resp.get("orderID") or resp.get("id")
+
+                    # Suggestion 4/5: log partial fills from FAK orders.
+                    size_matched = resp.get("size_matched") or resp.get("filled")
+                    if size_matched and float(size_matched) < trade["bet_amount"]:
+                        log.info(
+                            f"{label} | Partial fill: "
+                            f"${float(size_matched):.2f} of ${trade['bet_amount']:.2f} "
+                            f"| Order ID: {order_id}"
                         )
                     else:
-                        log.warning(
-                            f"{label} | no match — retry {attempt} (FOK)"
-                        )
-                        resp = place_market_order(
-                            self.client,
-                            trade["token_id"],
-                            trade["bet_amount"],
-                        )
-                    order_id = resp.get("orderID") or resp.get("id")
-                    log.info(f"{label} | Order ID: {order_id}")
+                        log.info(f"{label} | Order ID: {order_id}")
                     break
+
                 except Exception as e:
                     if "no match" in str(e).lower() and attempt < max_attempts - 1:
                         continue

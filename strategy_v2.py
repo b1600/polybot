@@ -242,7 +242,7 @@ class LateScalpStrategy:
         min_edge: float = 0.05,           # need 5% edge minimum
         min_bet: float = 1.0,
         max_bet_pct: float = 0.10,        # max 10% of bankroll
-        entry_window_seconds: int = 30,   # only act in last 30s
+        entry_window_seconds: int = 60,   # act in last 60s (more liquidity vs 30s)
     ):
         self.min_delta_pct = min_delta_pct
         self.kelly_fraction = kelly_fraction

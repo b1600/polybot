@@ -72,21 +72,40 @@ def place_maker_order(client, token_id, price, size):
     resp = client.post_order(signed_order, OrderType.GTC)
     return resp
 
-def place_market_order(client, token_id, amount):
+def get_ask_depth(client, token_id) -> list:
     """
-    Place a FOK (Fill-or-Kill) market order.
-    This pays taker fees but guarantees immediate execution.
-    Use when you need speed (e.g., last few seconds of window).
+    Fetch the current ask side of the order book.
+    Returns a list of OrderSummary(price, size) or [] if empty/unavailable.
+    Used to pre-check liquidity before placing a SCALP order.
+    """
+    try:
+        book = client.get_order_book(token_id)
+        if book and book.asks:
+            return book.asks
+    except Exception as e:
+        log.warning(f"Order book fetch failed: {e}")
+    return []
+
+
+def place_market_order(client, token_id, amount, price=0):
+    """
+    Place a FAK (Fill-and-Kill = IOC) market order.
+    Fills as much as possible at or below `price`, cancels the rest.
+    Accepts partial fills — better than FOK when liquidity is thin.
+
+    price=0  → SDK auto-calculates from the live order book (sweeps best ask).
+    price>0  → acts as a worst-case price cap (for walk-up retries).
     amount is in USD (USDC).
     """
     market_args = MarketOrderArgs(
         token_id=token_id,
         amount=amount,
         side=BUY,
-        order_type=OrderType.FOK,
+        order_type=OrderType.FAK,
+        price=price,
     )
     signed_order = client.create_market_order(market_args)
-    resp = client.post_order(signed_order, OrderType.FOK)
+    resp = client.post_order(signed_order, OrderType.FAK)
     return resp
 
 def cancel_order(client, order_id):
