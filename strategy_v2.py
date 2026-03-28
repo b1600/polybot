@@ -103,8 +103,8 @@ class EarlyMomentumStrategy:
 
         kelly_bet = f_star * self.kelly_fraction
         bet_amount = kelly_bet * bankroll
-        bet_amount = max(self.min_bet, bet_amount)
         bet_amount = min(bet_amount, bankroll * self.max_bet_pct)
+        bet_amount = max(self.min_bet, bet_amount)
 
         log.info(
             f"MOMENTUM | {side} @ ${market_price:.2f} | "
@@ -296,8 +296,8 @@ class LateScalpStrategy:
 
         kelly_bet = f_star * self.kelly_fraction
         bet_amount = kelly_bet * bankroll
-        bet_amount = max(self.min_bet, bet_amount)
         bet_amount = min(bet_amount, bankroll * self.max_bet_pct)
+        bet_amount = max(self.min_bet, bet_amount)
 
         log.info(
             f"SCALP | {side} @ ${market_price:.2f} | "

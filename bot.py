@@ -1,12 +1,11 @@
 # bot.py — v2 multi-phase trading loop
 #
-# Three all-taker strategies fire at different phases:
+# Three strategies fire at different phases:
 #   T-120 → T-30:  Early momentum (directional, taker)
 #   T-180 → T-30:  Fade extreme spikes (opportunistic, taker)
-#   T-15  → T-3:   Late-window directional scalp (taker)
+#   T-30  → T-3:   Late-window directional scalp (taker, with maker fallback)
 #
-# All strategies use taker (market) orders — no maker orders,
-# no cancel-after-fill dependency.
+# SCALP uses FOK; on "no match" retries up to 2x with FOK again.
 # ─────────────────────────────────────────────────────────
 
 import asyncio
@@ -330,7 +329,11 @@ class TradingBot:
     # ── Execution: Directional (Momentum / Fade / Scalp) ──────────────
 
     async def _execute_directional(self, trade: dict, label: str):
-        """Execute a single directional trade (scalp or fade)."""
+        """Execute a single directional trade (scalp or fade).
+
+        For SCALP: retries up to SCALP_MAX_RETRIES times with FOK on "no match".
+        Non-SCALP labels fail fast.
+        """
         log.info(
             f"{label} | {trade['side']} @ ${trade['price']:.2f} | "
             f"Edge: {trade['edge']*100:.1f}% | "
@@ -338,19 +341,36 @@ class TradingBot:
             f"Shares: {trade['shares']}"
         )
 
+        SCALP_MAX_RETRIES = 2
+
         order_id = None
         if not self.dry_run:
-            try:
-                resp = place_market_order(
-                    self.client,
-                    trade["token_id"],
-                    trade["bet_amount"],
-                )
-                order_id = resp.get("orderID") or resp.get("id")
-                log.info(f"{label} | Order ID: {order_id}")
-            except Exception as e:
-                log.error(f"{label} | Order failed: {e}")
-                return
+            max_attempts = (SCALP_MAX_RETRIES + 1) if label == "SCALP" else 1
+            for attempt in range(max_attempts):
+                try:
+                    if attempt == 0:
+                        resp = place_market_order(
+                            self.client,
+                            trade["token_id"],
+                            trade["bet_amount"],
+                        )
+                    else:
+                        log.warning(
+                            f"{label} | no match — retry {attempt} (FOK)"
+                        )
+                        resp = place_market_order(
+                            self.client,
+                            trade["token_id"],
+                            trade["bet_amount"],
+                        )
+                    order_id = resp.get("orderID") or resp.get("id")
+                    log.info(f"{label} | Order ID: {order_id}")
+                    break
+                except Exception as e:
+                    if "no match" in str(e).lower() and attempt < max_attempts - 1:
+                        continue
+                    log.error(f"{label} | Order failed: {e}")
+                    return
 
         trade_record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
