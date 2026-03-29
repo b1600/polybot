@@ -354,15 +354,6 @@ class TradingBot:
         if not self.dry_run:
             max_attempts = (SCALP_MAX_RETRIES + 1) if label == "SCALP" else 1
 
-            # Suggestion 1: pre-check order book depth before any attempt.
-            # If asks are empty the SDK will raise "no match" every time —
-            # skip all retries and save ~0.9s of wasted round-trips.
-            if label == "SCALP":
-                asks = get_ask_depth(self.client, trade["token_id"])
-                if not asks:
-                    log.warning(f"{label} | Order book empty — skipping")
-                    return
-
             for attempt in range(max_attempts):
                 # Suggestion 2: walk up price cap each retry.
                 # attempt 0 → base price, attempt 1 → +0.01, attempt 2 → +0.02
@@ -371,12 +362,17 @@ class TradingBot:
                     if label == "SCALP" else 0
                 )
 
+                if label == "SCALP":
+                    asks = get_ask_depth(self.client, trade["token_id"])
+                    if not asks:
+                        log.warning(f"{label} | Order book empty — skipping attempt {attempt + 1}")
+                        await asyncio.sleep(1)
+                        continue
+
                 if attempt > 0:
                     log.warning(
                         f"{label} | no match — retry {attempt} (FAK @ ${price_cap:.2f})"
                     )
-                    # Suggestion 6: wait 1s between retries so market makers
-                    # have time to repost asks before the next attempt.
                     await asyncio.sleep(1)
 
                 try:
