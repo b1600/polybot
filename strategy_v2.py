@@ -11,9 +11,9 @@
 #    Buy the cheap side when market price is extreme (>0.85) AND
 #    the move looks like a spike (5s vol >> 60s vol). Taker order.
 #
-# C) Late-Window Scalp (T-30 to T-3):
-#    Directional taker bet when delta >0.15% and very little time
-#    remains for a reversal. Quarter-Kelly, guaranteed fill.
+# C) Mid-Window Scalp (T-90 to T-10):
+#    Directional taker bet (FAK) when book has asks, or GTC maker
+#    when book is empty. Fires at T-90 where liquidity still exists.
 #
 # WHY MM WAS REMOVED:
 # ─────────────────────────────────────────────────────────
@@ -54,7 +54,7 @@ class EarlyMomentumStrategy:
         min_bet: float = 1.0,
         max_bet_pct: float = 0.10,         # max 10% of bankroll
         entry_start: int = 120,            # start evaluating at T-120
-        entry_end: int = 30,               # stop at T-30
+        entry_end: int = 90,               # stop at T-90 (scalp takes over)
     ):
         self.min_delta_pct = min_delta_pct
         self.kelly_fraction = kelly_fraction
@@ -221,18 +221,16 @@ class FadeExtremeStrategy:
 # STRATEGY C: Late-Window Scalp (secondary strategy)
 # ═══════════════════════════════════════════════════════════
 #
-# The ONLY time retail can reliably predict direction is in the
-# very last seconds of a window, when:
-#   1. BTC delta is large (>0.15%) AND
-#   2. Time remaining is small (<30s) AND
-#   3. The Polymarket price hasn't fully caught up
-#
-# This is rare. The bot should trigger on maybe 5-10% of windows.
-# When it does, use a market (taker) order for guaranteed fill.
+# At T-90 the order book still has resting asks from market makers.
+# By T-30 those asks are gone. So we enter at T-90 and use:
+#   - FAK if the book has asks (immediate fill)
+#   - GTC maker if the book is empty (rests until filled or cancelled at T-3)
+# Stops at T-10 to leave time for the order to process.
 
 class LateScalpStrategy:
     """
-    Bet direction only in the last 30 seconds when delta is extreme.
+    Bet direction in the last 90 seconds when delta is large.
+    FAK if book has asks; GTC maker order if book is empty.
     """
 
     def __init__(
@@ -242,7 +240,7 @@ class LateScalpStrategy:
         min_edge: float = 0.05,           # need 5% edge minimum
         min_bet: float = 1.0,
         max_bet_pct: float = 0.10,        # max 10% of bankroll
-        entry_window_seconds: int = 60,   # act in last 60s (more liquidity vs 30s)
+        entry_window_seconds: int = 90,   # act in last 90s — book still has depth
     ):
         self.min_delta_pct = min_delta_pct
         self.kelly_fraction = kelly_fraction
@@ -259,7 +257,7 @@ class LateScalpStrategy:
         if seconds_remaining > self.entry_window_seconds:
             return None
 
-        if seconds_remaining < 3:
+        if seconds_remaining < 10:
             return None  # too late, order won't fill
 
         delta = price_feed.get_window_delta()
@@ -315,7 +313,7 @@ class LateScalpStrategy:
             "edge": round(net_edge, 4),
             "kelly_pct": round(kelly_bet, 4),
             "estimated_prob": round(prob_win, 4),
-            "use_maker": False,  # always taker this late
+            "use_maker": False,  # executor decides FAK vs GTC based on book depth
             "strategy": "scalp",
         }
 
@@ -346,13 +344,13 @@ class CombinedStrategy:
     def evaluate_phase(self, market, bankroll, price_feed, seconds_remaining):
         """
         Called multiple times per window. Returns:
-        - ("momentum", trade)  — early directional bet (T-120 to T-30)
-        - ("fade", trade)      — fade a spike (T-180 to T-30)
-        - ("scalp", trade)     — directional bet (last 30s)
+        - ("momentum", trade)  — early directional bet (T-120 to T-90)
+        - ("fade", trade)      — fade a spike (T-180 to T-90)
+        - ("scalp", trade)     — directional bet (T-90 to T-10)
         - ("skip", None)       — do nothing this phase
         """
-        # Phase 1: Early momentum (T-120 to T-30)
-        if not self._momentum_fired and 30 <= seconds_remaining <= 120:
+        # Phase 1: Early momentum (T-120 to T-90)
+        if not self._momentum_fired and 90 <= seconds_remaining <= 120:
             trade = self.momentum.evaluate(
                 market, bankroll, price_feed, seconds_remaining
             )
@@ -360,16 +358,16 @@ class CombinedStrategy:
                 self._momentum_fired = True
                 return ("momentum", trade)
 
-        # Phase 2: Fade extreme odds (T-180 to T-30)
-        if 30 < seconds_remaining <= 180:
+        # Phase 2: Fade extreme odds (T-180 to T-90)
+        if 90 < seconds_remaining <= 180:
             trade = self.fade.evaluate(
                 market, bankroll, price_feed, seconds_remaining
             )
             if trade:
                 return ("fade", trade)
 
-        # Phase 3: Late scalp (last 30s)
-        if seconds_remaining <= 30:
+        # Phase 3: Mid-window scalp (T-90 to T-10) — book still has depth here
+        if seconds_remaining <= 90:
             trade = self.scalp.evaluate(
                 market, bankroll, price_feed, seconds_remaining
             )

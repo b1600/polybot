@@ -28,6 +28,7 @@ from strategy_v2 import CombinedStrategy
 from executor import (
     init_client,
     place_market_order,
+    place_maker_order,
     get_ask_depth,
     cancel_all,
     get_usdc_balance,
@@ -347,58 +348,62 @@ class TradingBot:
             f"Shares: {trade['shares']}"
         )
 
-        SCALP_MAX_RETRIES = 2
-        SCALP_PRICE_STEP = 0.01  # walk up 1 tick per retry
-
         order_id = None
         if not self.dry_run:
-            max_attempts = (SCALP_MAX_RETRIES + 1) if label == "SCALP" else 1
-
-            for attempt in range(max_attempts):
-                # Suggestion 2: walk up price cap each retry.
-                # attempt 0 → base price, attempt 1 → +0.01, attempt 2 → +0.02
-                price_cap = (
-                    round(trade["price"] + attempt * SCALP_PRICE_STEP, 2)
-                    if label == "SCALP" else 0
-                )
-
-                if label == "SCALP":
-                    asks = get_ask_depth(self.client, trade["token_id"])
-                    if not asks:
-                        log.warning(f"{label} | Order book empty — skipping attempt {attempt + 1}")
-                        await asyncio.sleep(1)
-                        continue
-
-                if attempt > 0:
-                    log.warning(
-                        f"{label} | no match — retry {attempt} (FAK @ ${price_cap:.2f})"
+            if label == "SCALP":
+                asks = get_ask_depth(self.client, trade["token_id"])
+                if asks:
+                    # Book has liquidity — use FAK for immediate fill
+                    try:
+                        resp = place_market_order(
+                            self.client,
+                            trade["token_id"],
+                            trade["bet_amount"],
+                            price=trade["price"],
+                        )
+                        order_id = resp.get("orderID") or resp.get("id")
+                        size_matched = resp.get("size_matched") or resp.get("filled")
+                        if size_matched and float(size_matched) < trade["bet_amount"]:
+                            log.info(
+                                f"{label} | FAK partial fill: "
+                                f"${float(size_matched):.2f} of ${trade['bet_amount']:.2f} "
+                                f"| Order ID: {order_id}"
+                            )
+                        else:
+                            log.info(f"{label} | FAK filled | Order ID: {order_id}")
+                    except Exception as e:
+                        log.error(f"{label} | FAK failed: {e}")
+                        return
+                else:
+                    # Book is empty — place GTC maker order immediately (no retries)
+                    log.info(
+                        f"{label} | Order book empty — placing GTC maker "
+                        f"@ ${trade['price']:.2f} x {trade['shares']} shares"
                     )
-                    await asyncio.sleep(1)
-
+                    try:
+                        resp = place_maker_order(
+                            self.client,
+                            trade["token_id"],
+                            trade["price"],
+                            trade["shares"],
+                        )
+                        order_id = resp.get("orderID") or resp.get("id")
+                        log.info(f"{label} | GTC maker resting | Order ID: {order_id}")
+                    except Exception as e:
+                        log.error(f"{label} | GTC maker failed: {e}")
+                        return
+            else:
+                # Non-SCALP: single FAK, no price cap
                 try:
                     resp = place_market_order(
                         self.client,
                         trade["token_id"],
                         trade["bet_amount"],
-                        price=price_cap,
+                        price=0,
                     )
                     order_id = resp.get("orderID") or resp.get("id")
-
-                    # Suggestion 4/5: log partial fills from FAK orders.
-                    size_matched = resp.get("size_matched") or resp.get("filled")
-                    if size_matched and float(size_matched) < trade["bet_amount"]:
-                        log.info(
-                            f"{label} | Partial fill: "
-                            f"${float(size_matched):.2f} of ${trade['bet_amount']:.2f} "
-                            f"| Order ID: {order_id}"
-                        )
-                    else:
-                        log.info(f"{label} | Order ID: {order_id}")
-                    break
-
+                    log.info(f"{label} | Order ID: {order_id}")
                 except Exception as e:
-                    if "no match" in str(e).lower() and attempt < max_attempts - 1:
-                        continue
                     log.error(f"{label} | Order failed: {e}")
                     return
 
@@ -467,6 +472,15 @@ class TradingBot:
         for trade in self.window.trades:
             # Skip cancelled orders — no P&L
             if trade.get("status") == "cancelled":
+                continue
+
+            # Skip trades where no order was placed (e.g. dry_run or pre-flight abort)
+            if trade.get("order_id") is None and not self.dry_run:
+                log.info(
+                    f"SKIP | {trade.get('strategy','?')} {trade.get('side','?')} "
+                    f"— no order placed (order_id is None)"
+                )
+                trade["status"] = "skipped"
                 continue
 
             side = trade["side"]
