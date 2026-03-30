@@ -5,7 +5,7 @@
 #   T-180 → T-30:  Fade extreme spikes (opportunistic, taker)
 #   T-30  → T-3:   Late-window directional scalp (taker, with maker fallback)
 #
-# SCALP uses FOK; on "no match" retries up to 2x with FOK again.
+# SCALP uses FAK; on "no match" (400) falls back to GTC maker at the same price.
 # ─────────────────────────────────────────────────────────
 
 import asyncio
@@ -373,7 +373,23 @@ class TradingBot:
                             log.info(f"{label} | FAK filled | Order ID: {order_id}")
                     except Exception as e:
                         log.error(f"{label} | FAK failed: {e}")
-                        return
+                        # Fallback: place GTC maker order at the same price
+                        log.info(
+                            f"{label} | FAK no match — falling back to GTC maker "
+                            f"@ ${trade['price']:.2f} x {trade['shares']} shares"
+                        )
+                        try:
+                            resp = place_maker_order(
+                                self.client,
+                                trade["token_id"],
+                                trade["price"],
+                                trade["shares"],
+                            )
+                            order_id = resp.get("orderID") or resp.get("id")
+                            log.info(f"{label} | GTC maker fallback resting | Order ID: {order_id}")
+                        except Exception as e2:
+                            log.error(f"{label} | GTC fallback failed: {e2}")
+                            return
                 else:
                     # Book is empty — place GTC maker order immediately (no retries)
                     log.info(
