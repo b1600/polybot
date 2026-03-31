@@ -29,11 +29,14 @@ from price_feed import BinancePriceFeed
 from strategy_v2 import CombinedStrategy
 from executor import (
     init_client,
+    place_maker_order,
     place_market_order,
     place_ioc_order,
     cancel_all,
     get_usdc_balance,
     get_ask_depth,
+    get_order_status,
+    redeem_positions,
 )
 
 load_dotenv()
@@ -122,6 +125,9 @@ class WindowState:
         # BTC prices for direct resolution (avoids Polymarket settlement lag)
         self.btc_open_price: float | None = None
         self.btc_close_price: float | None = None
+
+        # Cached from Gamma API — needed for on-chain redemption
+        self.condition_id: str | None = None
 
         # Order tracking
         self.trades: list[dict] = []
@@ -272,6 +278,9 @@ class TradingBot:
         # ── Check outcomes for all trades this window ──────
         await self._resolve_window()
 
+        # ── Redeem winning tokens on-chain → USDC.e back to proxy wallet ──
+        await self._redeem_wins()
+
         # ── Re-sync bankroll: catches fills missed by model ─
         await self._refresh_bankroll()
 
@@ -304,6 +313,10 @@ class TradingBot:
                 await asyncio.sleep(EVAL_INTERVAL)
                 continue
 
+            # Cache condition_id on first successful fetch for post-window redemption
+            if not self.window.condition_id and market.get("condition_id"):
+                self.window.condition_id = market["condition_id"]
+
             # Available bankroll = total - committed in open orders
             available = self.bankroll - self.window.committed_capital
             if available < 1.0:
@@ -334,7 +347,9 @@ class TradingBot:
     # ── Execution: Directional (Momentum / Fade) ──────────────────────
 
     async def _execute_directional(self, trade: dict, label: str):
-        """Single FAK taker order for MOMENTUM and FADE strategies."""
+        """GTC maker order for MOMENTUM and FADE strategies.
+        Posts a resting limit bid at maker_price; cancelled by cleanup sweep if unfilled.
+        """
         log.info(
             f"{label} | {trade['side']} @ ${trade['price']:.2f} | "
             f"Edge: {trade['edge']*100:.1f}% | "
@@ -345,14 +360,14 @@ class TradingBot:
         order_id = None
         if not self.dry_run:
             try:
-                resp = place_market_order(
+                resp = place_maker_order(
                     self.client,
                     trade["token_id"],
-                    trade["bet_amount"],
-                    price=0,
+                    price=trade["maker_price"],
+                    size=trade["shares"],
                 )
                 order_id = resp.get("orderID") or resp.get("id")
-                log.info(f"{label} | FAK placed | Order ID: {order_id}")
+                log.info(f"{label} | GTC resting | Order ID: {order_id}")
             except Exception as e:
                 log.error(f"{label} | Order failed: {e}")
                 return
@@ -439,12 +454,43 @@ class TradingBot:
     # ── End-of-window cleanup ──────────────────────────────
 
     async def _cleanup_window(self):
-        """Safety cancel_all sweep at window close (live mode only)."""
+        """Cancel all resting GTC orders at window close, then mark unfilled trades."""
         if not self.dry_run and self.client:
             try:
                 cancel_all(self.client)
             except Exception as e:
                 log.error(f"cancel_all safety sweep failed: {e}")
+
+            # Mark any still-pending GTC orders as cancelled so resolution skips them
+            for trade in self.window.trades:
+                if trade.get("status") != "pending" or not trade.get("order_id"):
+                    continue
+                if not trade.get("use_maker"):
+                    continue  # IOC orders self-cancel; don't need to check
+                try:
+                    info = get_order_status(self.client, trade["order_id"])
+                    size_matched = float(
+                        info.get("size_matched") or info.get("filled") or 0
+                    )
+                    if size_matched == 0:
+                        trade["status"] = "cancelled"
+                        log.info(
+                            f"GTC unfilled — cancelled | "
+                            f"{trade.get('strategy','?')} {trade.get('side','?')} "
+                            f"Order: {trade['order_id']}"
+                        )
+                    else:
+                        # Partial or full fill — record actual fill size for resolution
+                        trade["size_matched"] = size_matched
+                        log.info(
+                            f"GTC filled ${size_matched:.2f} | "
+                            f"{trade.get('strategy','?')} {trade.get('side','?')} "
+                            f"Order: {trade['order_id']}"
+                        )
+                except Exception as e:
+                    log.warning(
+                        f"Could not fetch GTC order status {trade['order_id']}: {e}"
+                    )
 
     # ── Resolution ─────────────────────────────────────────
 
@@ -501,9 +547,14 @@ class TradingBot:
                 continue
 
             side = trade["side"]
-            bet = trade["bet_amount"]
             price = trade["price"]
-            shares = trade.get("shares", bet / price if price > 0 else 0)
+            # For GTC orders, use actual filled size if available (may be partial fill)
+            if trade.get("use_maker") and "size_matched" in trade:
+                bet = trade["size_matched"]
+                shares = bet / price if price > 0 else 0
+            else:
+                bet = trade["bet_amount"]
+                shares = trade.get("shares", bet / price if price > 0 else 0)
 
             if side == winning_side:
                 # Win: each share pays $1.00, we paid $price per share
@@ -530,6 +581,61 @@ class TradingBot:
             trade["status"] = "resolved"
             trade["bankroll_after"] = round(self.bankroll, 2)
             self.total_trades += 1
+
+    # ── Redemption sweep ───────────────────────────────────
+
+    async def _redeem_wins(self):
+        """
+        For each winning trade this window, call redeemPositions on-chain so
+        the USDC.e flows back to the proxy wallet and is available next window.
+
+        Runs only in live mode. Skips silently if condition_id is unavailable
+        (e.g. market fetch failed all window) or if there were no wins.
+
+        The market must have resolved on-chain before redemption succeeds.
+        We already wait RESOLUTION_WAIT seconds after window close before
+        reaching this point, which is normally sufficient. If the chain hasn't
+        settled yet the call will revert and we log an error — the tokens stay
+        in the wallet and Polymarket's own sweeper will eventually redeem them.
+        """
+        if self.dry_run or not self.window:
+            return
+
+        condition_id = self.window.condition_id
+        if not condition_id:
+            log.warning("REDEEM | No condition_id cached — skipping redemption sweep")
+            return
+
+        winning_trades = [
+            t for t in self.window.trades
+            if t.get("outcome") == "win" and t.get("outcome_index") is not None
+        ]
+
+        if not winning_trades:
+            return
+
+        # De-duplicate: only one redemption call per outcome_index is needed
+        # even if somehow two trades landed on the same side.
+        seen: set[int] = set()
+        for trade in winning_trades:
+            outcome_index = trade["outcome_index"]
+            if outcome_index in seen:
+                continue
+            seen.add(outcome_index)
+
+            strategy = trade.get("strategy", "?")
+            try:
+                tx_hash = redeem_positions(condition_id, outcome_index)
+                log.info(
+                    f"REDEEM | {strategy} {trade['side']} | "
+                    f"Condition: …{condition_id[-8:]} | "
+                    f"Tx: {tx_hash}"
+                )
+            except Exception as e:
+                log.error(
+                    f"REDEEM FAILED | {strategy} {trade['side']} | "
+                    f"Condition: {condition_id} | {e}"
+                )
 
     # ── Bankroll sync ──────────────────────────────────────
 

@@ -10,6 +10,75 @@ load_dotenv()
 
 log = logging.getLogger("executor")
 
+# ── On-chain redemption ────────────────────────────────────
+# Polymarket 5-min BTC markets use the NegRisk system.
+# After a market resolves, winning tokens must be redeemed on-chain
+# via the NegRiskAdapter to return USDC.e to the proxy wallet.
+_NEG_RISK_ADAPTER = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+
+_REDEEM_ABI = [
+    {
+        "inputs": [
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "indexSets", "type": "uint256[]"},
+        ],
+        "name": "redeemPositions",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    }
+]
+
+
+def redeem_positions(condition_id: str, outcome_index: int) -> str:
+    """
+    Redeem winning NegRisk CTF tokens for USDC.e on-chain.
+
+    condition_id   : hex string (with or without 0x prefix) from Gamma API
+    outcome_index  : 0 for the first outcome (e.g. "Up"), 1 for the second ("Down")
+                     Maps to CTF indexSet: 0 → 1, 1 → 2
+
+    Returns the confirmed transaction hash.
+    Raises on revert or timeout.
+    """
+    from web3 import Web3
+
+    rpc = os.getenv(
+        "POLYGON_RPC",
+        "https://polygon-mainnet.g.alchemy.com/v2/" + os.getenv("ALCHEMY_API_KEY", ""),
+    )
+    w3 = Web3(Web3.HTTPProvider(rpc))
+    account = w3.eth.account.from_key(os.getenv("POLY_PRIVATE_KEY"))
+
+    adapter = w3.eth.contract(
+        address=Web3.to_checksum_address(_NEG_RISK_ADAPTER),
+        abi=_REDEEM_ABI,
+    )
+
+    condition_bytes = bytes.fromhex(condition_id.removeprefix("0x"))
+    index_set = 1 << outcome_index  # outcome 0 → 1, outcome 1 → 2
+
+    nonce = w3.eth.get_transaction_count(account.address, "pending")
+    gas_price = int(w3.eth.gas_price * 1.2)  # 20% above current base fee
+
+    tx = adapter.functions.redeemPositions(
+        condition_bytes, [index_set]
+    ).build_transaction({
+        "from": account.address,
+        "nonce": nonce,
+        "gas": 250_000,
+        "gasPrice": gas_price,
+    })
+    signed = account.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+    if receipt.status != 1:
+        raise RuntimeError(
+            f"redeemPositions reverted — condition: {condition_id} "
+            f"indexSet: {index_set} tx: {tx_hash.hex()}"
+        )
+    return tx_hash.hex()
+
 
 def get_usdc_balance(client) -> float:
     """Return the Polymarket CLOB trading balance in USDC.

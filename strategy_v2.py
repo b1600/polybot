@@ -53,7 +53,8 @@ class EarlyMomentumStrategy:
         min_delta_pct: float = 0.30,      # need ≥0.30% BTC move
         kelly_fraction: float = 0.25,      # quarter-Kelly
         min_edge: float = 0.05,            # need 5% net edge after fees
-        min_bet: float = 1.0,
+        min_bet: float = 2.50,             # GTC min: 5 shares × $0.50 = $2.50
+        min_shares: int = 5,               # Polymarket CLOB GTC minimum
         max_bet_pct: float = 0.10,         # max 10% of bankroll
         entry_start: int = 120,            # start evaluating at T-120
         entry_end: int = 90,               # stop at T-90 (scalp takes over)
@@ -62,6 +63,7 @@ class EarlyMomentumStrategy:
         self.kelly_fraction = kelly_fraction
         self.min_edge = min_edge
         self.min_bet = min_bet
+        self.min_shares = min_shares
         self.max_bet_pct = max_bet_pct
         self.entry_start = entry_start
         self.entry_end = entry_end
@@ -108,23 +110,29 @@ class EarlyMomentumStrategy:
         bet_amount = min(bet_amount, bankroll * self.max_bet_pct)
         bet_amount = max(self.min_bet, bet_amount)
 
+        # Enforce 5-share minimum for GTC orders
+        shares = max(self.min_shares, round(bet_amount / market_price, 1))
+        bet_amount = round(shares * market_price, 2)
+
         log.info(
             f"MOMENTUM | {side} @ ${market_price:.2f} | "
             f"Delta: {delta*100:+.3f}% | Vol: {vol*100:.4f}% | "
             f"P(win): {prob_win:.2f} | Edge: {net_edge:.3f} | "
-            f"Bet: ${bet_amount:.2f}"
+            f"Shares: {shares} | Bet: ${bet_amount:.2f}"
         )
 
         return {
             "side": side,
             "token_id": market[side]["token_id"],
+            "outcome_index": market[side]["outcome_index"],
             "price": market_price,
-            "bet_amount": round(bet_amount, 2),
-            "shares": round(bet_amount / market_price, 1),
+            "maker_price": market_price,   # GTC limit bid at current ask
+            "bet_amount": bet_amount,
+            "shares": shares,
             "edge": round(net_edge, 4),
             "kelly_pct": round(kelly_bet, 4),
             "estimated_prob": round(prob_win, 4),
-            "use_maker": False,   # taker — avoids instant-match + cancel problem
+            "use_maker": True,
             "strategy": "momentum",
         }
 
@@ -154,12 +162,14 @@ class FadeExtremeStrategy:
         self,
         extreme_threshold: float = 0.85,  # market price > this = extreme
         max_bet_pct: float = 0.03,         # tiny bets — these are longshots
-        min_bet: float = 1.0,
+        min_bet: float = 2.50,             # GTC min: 5 shares × $0.50 = $2.50
+        min_shares: int = 5,               # Polymarket CLOB GTC minimum
         spike_vol_ratio: float = 3.0,      # current vol must be 3x avg
     ):
         self.extreme_threshold = extreme_threshold
         self.max_bet_pct = max_bet_pct
         self.min_bet = min_bet
+        self.min_shares = min_shares
         self.spike_vol_ratio = spike_vol_ratio
 
     def evaluate(self, market, bankroll, price_feed, seconds_remaining):
@@ -199,22 +209,28 @@ class FadeExtremeStrategy:
         if bet_amount > bankroll * 0.10:
             return None  # don't risk too much on longshots
 
+        # Enforce 5-share minimum for GTC orders
+        shares = max(self.min_shares, round(bet_amount / cheap_price, 1))
+        bet_amount = round(shares * cheap_price, 2)
+
         log.info(
             f"FADE | {cheap_side} @ ${cheap_price:.2f} | "
             f"Spike ratio: {spike_ratio:.1f}x | "
-            f"Bet: ${bet_amount:.2f}"
+            f"Shares: {shares} | Bet: ${bet_amount:.2f}"
         )
 
         return {
             "side": cheap_side,
             "token_id": market[cheap_side]["token_id"],
+            "outcome_index": market[cheap_side]["outcome_index"],
             "price": cheap_price,
-            "bet_amount": round(bet_amount, 2),
-            "shares": round(bet_amount / cheap_price, 1),
+            "maker_price": cheap_price,    # GTC limit bid at current ask
+            "bet_amount": bet_amount,
+            "shares": shares,
             "edge": round(1.0 / cheap_price * 0.10 - 1.0, 4),  # rough EV
             "kelly_pct": 0.0,
             "estimated_prob": round(1.0 - self.extreme_threshold + 0.05, 4),
-            "use_maker": False,   # taker — avoids instant-match + cancel problem
+            "use_maker": True,
             "strategy": "fade",
         }
 
@@ -241,7 +257,8 @@ class LateScalpStrategy:
         kelly_fraction: float = 0.25,     # quarter-Kelly (conservative)
         min_edge: float = 0.05,           # need 5% edge minimum
         high_edge_threshold: float = 0.10, # edge above this → 2% max_price buffer
-        min_bet: float = 1.0,
+        min_bet: float = 2.50,            # IOC: match GTC floor for consistency
+        min_shares: int = 5,              # Polymarket CLOB minimum
         max_bet_pct: float = 0.10,        # max 10% of bankroll
         entry_window_seconds: int = 150,  # act in last 150s — enter before market reprices
     ):
@@ -250,6 +267,7 @@ class LateScalpStrategy:
         self.min_edge = min_edge
         self.high_edge_threshold = high_edge_threshold
         self.min_bet = min_bet
+        self.min_shares = min_shares
         self.max_bet_pct = max_bet_pct
         self.entry_window_seconds = entry_window_seconds
 
@@ -301,6 +319,10 @@ class LateScalpStrategy:
         bet_amount = min(bet_amount, bankroll * self.max_bet_pct)
         bet_amount = max(self.min_bet, bet_amount)
 
+        # Enforce 5-share minimum for IOC orders
+        shares = max(self.min_shares, round(bet_amount / market_price, 1))
+        bet_amount = round(shares * market_price, 2)
+
         # Max price we'll pay as a taker — keeps at least min_edge positive EV.
         # If estimated_prob is significantly above market_price (edge >= high_edge_threshold),
         # add a 2% buffer to improve fill probability without sacrificing positive EV.
@@ -312,16 +334,17 @@ class LateScalpStrategy:
             f"Delta: {delta*100:+.3f}% | Vol: {vol*100:.4f}% | "
             f"P(win): {prob_win:.2f} | Edge: {net_edge:.3f} | "
             f"Buffer: {'+2%' if price_buffer else 'none'} | "
-            f"Bet: ${bet_amount:.2f}"
+            f"Shares: {shares} | Bet: ${bet_amount:.2f}"
         )
 
         return {
             "side": side,
             "token_id": market[side]["token_id"],
+            "outcome_index": market[side]["outcome_index"],
             "price": market_price,
             "max_price": max_price,
-            "bet_amount": round(bet_amount, 2),
-            "shares": round(bet_amount / market_price, 1),
+            "bet_amount": bet_amount,
+            "shares": shares,
             "edge": round(net_edge, 4),
             "kelly_pct": round(kelly_bet, 4),
             "estimated_prob": round(prob_win, 4),

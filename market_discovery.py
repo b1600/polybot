@@ -54,6 +54,7 @@ def fetch_market(slug):
             result[outcome] = {
                 "token_id": token_ids[i] if i < len(token_ids) else None,
                 "price": float(prices[i]) if i < len(prices) else None,
+                "outcome_index": i,  # 0 → indexSet 1, 1 → indexSet 2 for CTF redemption
             }
         result["condition_id"] = condition_id
         result["active"] = active
