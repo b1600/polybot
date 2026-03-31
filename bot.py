@@ -1,11 +1,12 @@
 # bot.py — v2 multi-phase trading loop
 #
 # Three strategies fire at different phases:
-#   T-120 → T-30:  Early momentum (directional, taker)
-#   T-180 → T-30:  Fade extreme spikes (opportunistic, taker)
-#   T-30  → T-3:   Late-window directional scalp (taker, with maker fallback)
-#
-# SCALP uses FAK; on "no match" (400) falls back to GTC maker at the same price.
+#   T-120 → T-90:  Early momentum (directional, taker FAK)
+#   T-180 → T-90:  Fade extreme spikes (opportunistic, taker FAK)
+#   T-90  → T-15:  Late-window scalp — 3-phase execution:
+#                    T-90  Place GTC maker at signal price (≥5 shares)
+#                    T-45  If unfilled: cancel → FAK +1 tick; no match → FAK +2 ticks after 2s
+#                    T-15  Hard cancel_all — pull everything remaining
 # ─────────────────────────────────────────────────────────
 
 import asyncio
@@ -29,7 +30,8 @@ from executor import (
     init_client,
     place_market_order,
     place_maker_order,
-    get_ask_depth,
+    get_order_status,
+    cancel_order,
     cancel_all,
     get_usdc_balance,
 )
@@ -103,6 +105,9 @@ EVAL_INTERVAL = 5       # seconds between strategy evaluations within a window
 RESOLUTION_WAIT = 6     # seconds after window close before checking outcome
 MAX_TRADES_PER_WINDOW = 3  # hard cap: at most one of each strategy per window
 DAILY_LOSS_LIMIT_PCT = 0.25  # stop trading if down 25% from session start
+
+SCALP_TICK = 0.01        # minimum price increment on Polymarket
+SCALP_MIN_SHARES = 5     # minimum shares for the T-90 GTC maker order
 
 
 class WindowState:
@@ -321,26 +326,18 @@ class TradingBot:
                 self.window.fade_fired = True
 
             elif phase == "scalp" and not self.window.scalp_fired:
-                await self._execute_directional(result, "SCALP")
-                self.window.scalp_fired = True
+                self.window.scalp_fired = True  # set before await — _execute_scalp runs until T-15
+                await self._execute_scalp(result)
+                break  # scalp manages its own timing to T-15; exit eval loop
 
             # Sleep until next tick
             sleep_time = min(EVAL_INTERVAL, max(1, seconds_remaining - 3))
             await asyncio.sleep(sleep_time)
 
-    # ── Execution: Directional (Momentum / Fade / Scalp) ──────────────
+    # ── Execution: Directional (Momentum / Fade) ──────────────────────
 
     async def _execute_directional(self, trade: dict, label: str):
-        """Execute a single directional trade (scalp or fade).
-
-        For SCALP:
-        - Pre-checks order book; aborts immediately if asks are empty (suggestion 1).
-        - Uses FAK (Fill-and-Kill = IOC) to accept partial fills (suggestion 4).
-        - Retries up to SCALP_MAX_RETRIES times, walking up the price cap by
-          SCALP_PRICE_STEP each attempt so a higher ask can be hit (suggestion 2).
-        - Waits 1s between retries to let the book refill (suggestion 6).
-        Non-SCALP labels use a single FAK attempt with no price cap (price=0).
-        """
+        """Single FAK taker order for MOMENTUM and FADE strategies."""
         log.info(
             f"{label} | {trade['side']} @ ${trade['price']:.2f} | "
             f"Edge: {trade['edge']*100:.1f}% | "
@@ -350,78 +347,18 @@ class TradingBot:
 
         order_id = None
         if not self.dry_run:
-            if label == "SCALP":
-                asks = get_ask_depth(self.client, trade["token_id"])
-                if asks:
-                    # Book has liquidity — use FAK for immediate fill
-                    try:
-                        resp = place_market_order(
-                            self.client,
-                            trade["token_id"],
-                            trade["bet_amount"],
-                            price=trade["price"],
-                        )
-                        order_id = resp.get("orderID") or resp.get("id")
-                        size_matched = resp.get("size_matched") or resp.get("filled")
-                        if size_matched and float(size_matched) < trade["bet_amount"]:
-                            log.info(
-                                f"{label} | FAK partial fill: "
-                                f"${float(size_matched):.2f} of ${trade['bet_amount']:.2f} "
-                                f"| Order ID: {order_id}"
-                            )
-                        else:
-                            log.info(f"{label} | FAK filled | Order ID: {order_id}")
-                    except Exception as e:
-                        log.error(f"{label} | FAK failed: {e}")
-                        # Fallback: place GTC maker order at the same price
-                        log.info(
-                            f"{label} | FAK no match — falling back to GTC maker "
-                            f"@ ${trade['price']:.2f} x {trade['shares']} shares"
-                        )
-                        try:
-                            resp = place_maker_order(
-                                self.client,
-                                trade["token_id"],
-                                trade["price"],
-                                trade["shares"],
-                            )
-                            order_id = resp.get("orderID") or resp.get("id")
-                            log.info(f"{label} | GTC maker fallback resting | Order ID: {order_id}")
-                        except Exception as e2:
-                            log.error(f"{label} | GTC fallback failed: {e2}")
-                            return
-                else:
-                    # Book is empty — place GTC maker order immediately (no retries)
-                    log.info(
-                        f"{label} | Order book empty — placing GTC maker "
-                        f"@ ${trade['price']:.2f} x {trade['shares']} shares"
-                    )
-                    try:
-                        resp = place_maker_order(
-                            self.client,
-                            trade["token_id"],
-                            trade["price"],
-                            trade["shares"],
-                        )
-                        order_id = resp.get("orderID") or resp.get("id")
-                        log.info(f"{label} | GTC maker resting | Order ID: {order_id}")
-                    except Exception as e:
-                        log.error(f"{label} | GTC maker failed: {e}")
-                        return
-            else:
-                # Non-SCALP: single FAK, no price cap
-                try:
-                    resp = place_market_order(
-                        self.client,
-                        trade["token_id"],
-                        trade["bet_amount"],
-                        price=0,
-                    )
-                    order_id = resp.get("orderID") or resp.get("id")
-                    log.info(f"{label} | Order ID: {order_id}")
-                except Exception as e:
-                    log.error(f"{label} | Order failed: {e}")
-                    return
+            try:
+                resp = place_market_order(
+                    self.client,
+                    trade["token_id"],
+                    trade["bet_amount"],
+                    price=0,
+                )
+                order_id = resp.get("orderID") or resp.get("id")
+                log.info(f"{label} | FAK placed | Order ID: {order_id}")
+            except Exception as e:
+                log.error(f"{label} | Order failed: {e}")
+                return
 
         trade_record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -430,6 +367,149 @@ class TradingBot:
             "order_id": order_id,
             "status": "pending",
             **trade,
+            "bankroll_before": self.bankroll,
+        }
+        self.window.trades.append(trade_record)
+        self.trade_log.append(trade_record)
+
+    # ── Execution: Scalp (3-phase GTC → FAK escalation) ───────────────
+
+    async def _execute_scalp(self, trade: dict):
+        """
+        Three-phase scalp execution spanning T-90 to T-15:
+
+        T-90  Place GTC maker at signal price, at least SCALP_MIN_SHARES shares.
+              Poll fill status every 3s.
+
+        T-45  If still unfilled: cancel GTC.
+              FAK at signal_price + 1 tick.
+              If no match: wait 2s, retry FAK at + 2 ticks.
+
+        T-15  Hard cancel_all — pull everything remaining.
+        """
+        token_id = trade["token_id"]
+        signal_price = trade["price"]
+        shares = max(SCALP_MIN_SHARES, trade["shares"])
+        bet_amount = round(shares * signal_price, 2)
+        window_end = self.window.window_end
+
+        log.info(
+            f"SCALP | {trade['side']} @ ${signal_price:.2f} | "
+            f"Edge: {trade['edge']*100:.1f}% | "
+            f"Shares: {shares} | Bet: ${bet_amount:.2f}"
+        )
+
+        order_id = None
+
+        if not self.dry_run:
+            # ── Phase 1: T-90 — Place GTC maker ────────────────
+            try:
+                resp = place_maker_order(self.client, token_id, signal_price, shares)
+                order_id = resp.get("orderID") or resp.get("id")
+                log.info(
+                    f"SCALP | GTC placed @ ${signal_price:.2f} "
+                    f"x {shares} shares | Order: {order_id}"
+                )
+            except Exception as e:
+                log.error(f"SCALP | GTC placement failed: {e}")
+                return
+
+            # ── Poll every 3s until T-45 ────────────────────────
+            gtc_filled = False
+            while True:
+                now = time.time()
+                if window_end - now <= 45:
+                    break
+                try:
+                    info = get_order_status(self.client, order_id)
+                    if (info.get("status") or "").upper() in ("MATCHED", "FILLED"):
+                        gtc_filled = True
+                        log.info(f"SCALP | GTC filled before T-45 | Order: {order_id}")
+                        break
+                except Exception as e:
+                    log.warning(f"SCALP | Status poll failed: {e}")
+                sleep_for = min(3.0, window_end - 45 - time.time())
+                if sleep_for <= 0:
+                    break
+                await asyncio.sleep(sleep_for)
+
+            # Final fill check at T-45
+            if not gtc_filled:
+                try:
+                    info = get_order_status(self.client, order_id)
+                    gtc_filled = (info.get("status") or "").upper() in ("MATCHED", "FILLED")
+                except Exception:
+                    pass
+
+            if not gtc_filled:
+                # ── Phase 2: T-45 — Cancel GTC, escalate FAK ────
+                try:
+                    cancel_order(self.client, order_id)
+                    log.info(f"SCALP | GTC cancelled at T-45 | Order: {order_id}")
+                except Exception as e:
+                    log.warning(f"SCALP | T-45 cancel failed: {e}")
+
+                fak_filled = False
+                for tick_offset, pre_wait in [(1, 0), (2, 2)]:
+                    if window_end - time.time() <= 15:
+                        log.info("SCALP | Inside T-15 window — skipping FAK")
+                        break
+                    if pre_wait > 0:
+                        await asyncio.sleep(pre_wait)
+                    if window_end - time.time() <= 15:
+                        log.info("SCALP | Inside T-15 window after wait — skipping FAK")
+                        break
+
+                    fak_price = round(signal_price + tick_offset * SCALP_TICK, 2)
+                    try:
+                        resp = place_market_order(
+                            self.client, token_id, bet_amount, price=fak_price
+                        )
+                        fak_order_id = resp.get("orderID") or resp.get("id")
+                        size_matched = float(
+                            resp.get("size_matched") or resp.get("filled") or 0
+                        )
+                        if size_matched > 0:
+                            fak_filled = True
+                            order_id = fak_order_id
+                            log.info(
+                                f"SCALP | FAK +{tick_offset}t @ ${fak_price:.2f} "
+                                f"matched ${size_matched:.2f} | Order: {fak_order_id}"
+                            )
+                            break  # filled — skip second attempt
+                        else:
+                            log.info(
+                                f"SCALP | FAK +{tick_offset}t @ ${fak_price:.2f} "
+                                f"no match | Order: {fak_order_id}"
+                            )
+                    except Exception as e:
+                        log.warning(f"SCALP | FAK +{tick_offset}t failed: {e}")
+
+                if not fak_filled:
+                    # GTC cancelled + all FAKs failed — no position taken
+                    log.info("SCALP | No fill achieved — trade skipped at resolution")
+                    order_id = None
+
+            # ── Phase 3: T-15 — Hard cancel ─────────────────────
+            now = time.time()
+            remaining = window_end - now
+            if remaining > 15:
+                await asyncio.sleep(remaining - 15)
+            try:
+                cancel_all(self.client)
+                log.info("SCALP | T-15 hard cancel all")
+            except Exception as e:
+                log.warning(f"SCALP | T-15 cancel_all failed: {e}")
+
+        trade_record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "window": self.window.window_start,
+            "slug": self.window.slug,
+            "order_id": order_id,
+            "status": "pending",
+            **trade,
+            "bet_amount": bet_amount,
+            "shares": shares,
             "bankroll_before": self.bankroll,
         }
         self.window.trades.append(trade_record)

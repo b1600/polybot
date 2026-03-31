@@ -118,3 +118,7 @@ def cancel_order(client, order_id):
 def cancel_all(client):
     """Cancel all open orders."""
     return client.cancel_all()
+
+def get_order_status(client, order_id) -> dict:
+    """Fetch current order info (status, size_matched, original_size, etc.)."""
+    return client.get_order(order_id)
