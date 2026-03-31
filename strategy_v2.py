@@ -11,9 +11,11 @@
 #    Buy the cheap side when market price is extreme (>0.85) AND
 #    the move looks like a spike (5s vol >> 60s vol). Taker order.
 #
-# C) Mid-Window Scalp (T-90 to T-10):
-#    Directional taker bet (FAK) when book has asks, or GTC maker
-#    when book is empty. Fires at T-90 where liquidity still exists.
+# C) Mid-Window Scalp (T-150 to T-10):
+#    Single-shot FAK taker bet after checking order book depth.
+#    Enters at T-150 before counter-parties reprice away from the current ask.
+#    Caps the fill price at prob_win - min_edge to preserve positive EV.
+#    Skips if the book has no asks (illiquid market).
 #
 # WHY MM WAS REMOVED:
 # ─────────────────────────────────────────────────────────
@@ -229,8 +231,10 @@ class FadeExtremeStrategy:
 
 class LateScalpStrategy:
     """
-    Bet direction in the last 90 seconds when delta is large.
-    FAK if book has asks; GTC maker order if book is empty.
+    Directional taker bet in the last 150 seconds when delta is large.
+    Fires a single FAK at the current market ask, capped at max_price
+    (prob_win - min_edge) to guarantee positive EV even after spread crossing.
+    Skips if the order book has no asks (illiquid).
     """
 
     def __init__(
@@ -240,7 +244,7 @@ class LateScalpStrategy:
         min_edge: float = 0.05,           # need 5% edge minimum
         min_bet: float = 1.0,
         max_bet_pct: float = 0.10,        # max 10% of bankroll
-        entry_window_seconds: int = 90,   # act in last 90s — book still has depth
+        entry_window_seconds: int = 150,  # act in last 150s — enter before market reprices
     ):
         self.min_delta_pct = min_delta_pct
         self.kelly_fraction = kelly_fraction
@@ -297,8 +301,13 @@ class LateScalpStrategy:
         bet_amount = min(bet_amount, bankroll * self.max_bet_pct)
         bet_amount = max(self.min_bet, bet_amount)
 
+        # Max price we'll pay as a taker — keeps at least min_edge positive EV.
+        # With P(win)=0.90 and min_edge=0.05 this gives max_price=0.85,
+        # vs the old signal_price of ~0.49. Far more likely to get filled.
+        max_price = round(min(prob_win - self.min_edge, 0.95), 2)
+
         log.info(
-            f"SCALP | {side} @ ${market_price:.2f} | "
+            f"SCALP | {side} @ ${market_price:.2f} (max ${max_price:.2f}) | "
             f"Delta: {delta*100:+.3f}% | Vol: {vol*100:.4f}% | "
             f"P(win): {prob_win:.2f} | Edge: {net_edge:.3f} | "
             f"Bet: ${bet_amount:.2f}"
@@ -308,12 +317,13 @@ class LateScalpStrategy:
             "side": side,
             "token_id": market[side]["token_id"],
             "price": market_price,
+            "max_price": max_price,
             "bet_amount": round(bet_amount, 2),
             "shares": round(bet_amount / market_price, 1),
             "edge": round(net_edge, 4),
             "kelly_pct": round(kelly_bet, 4),
             "estimated_prob": round(prob_win, 4),
-            "use_maker": False,  # executor decides FAK vs GTC based on book depth
+            "use_maker": False,
             "strategy": "scalp",
         }
 
@@ -366,8 +376,8 @@ class CombinedStrategy:
             if trade:
                 return ("fade", trade)
 
-        # Phase 3: Mid-window scalp (T-90 to T-10) — book still has depth here
-        if seconds_remaining <= 90:
+        # Phase 3: Mid-window scalp (T-150 to T-10) — enter before market reprices
+        if seconds_remaining <= 150:
             trade = self.scalp.evaluate(
                 market, bankroll, price_feed, seconds_remaining
             )
