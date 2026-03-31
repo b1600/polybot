@@ -12,7 +12,7 @@
 #    the move looks like a spike (5s vol >> 60s vol). Taker order.
 #
 # C) Mid-Window Scalp (T-150 to T-10):
-#    Single-shot FAK taker bet after checking order book depth.
+#    Single-shot IOC taker bet after checking order book depth.
 #    Enters at T-150 before counter-parties reprice away from the current ask.
 #    Caps the fill price at prob_win - min_edge to preserve positive EV.
 #    Skips if the book has no asks (illiquid market).
@@ -224,15 +224,13 @@ class FadeExtremeStrategy:
 # ═══════════════════════════════════════════════════════════
 #
 # At T-90 the order book still has resting asks from market makers.
-# By T-30 those asks are gone. So we enter at T-90 and use:
-#   - FAK if the book has asks (immediate fill)
-#   - GTC maker if the book is empty (rests until filled or cancelled at T-3)
+# By T-30 those asks are gone. So we enter at T-150 with a single IOC order.
 # Stops at T-10 to leave time for the order to process.
 
 class LateScalpStrategy:
     """
     Directional taker bet in the last 150 seconds when delta is large.
-    Fires a single FAK at the current market ask, capped at max_price
+    Fires a single IOC order at the current market ask, capped at max_price
     (prob_win - min_edge) to guarantee positive EV even after spread crossing.
     Skips if the order book has no asks (illiquid).
     """
@@ -242,6 +240,7 @@ class LateScalpStrategy:
         min_delta_pct: float = 0.15,     # minimum 0.15% BTC move
         kelly_fraction: float = 0.25,     # quarter-Kelly (conservative)
         min_edge: float = 0.05,           # need 5% edge minimum
+        high_edge_threshold: float = 0.10, # edge above this → 2% max_price buffer
         min_bet: float = 1.0,
         max_bet_pct: float = 0.10,        # max 10% of bankroll
         entry_window_seconds: int = 150,  # act in last 150s — enter before market reprices
@@ -249,6 +248,7 @@ class LateScalpStrategy:
         self.min_delta_pct = min_delta_pct
         self.kelly_fraction = kelly_fraction
         self.min_edge = min_edge
+        self.high_edge_threshold = high_edge_threshold
         self.min_bet = min_bet
         self.max_bet_pct = max_bet_pct
         self.entry_window_seconds = entry_window_seconds
@@ -302,14 +302,16 @@ class LateScalpStrategy:
         bet_amount = max(self.min_bet, bet_amount)
 
         # Max price we'll pay as a taker — keeps at least min_edge positive EV.
-        # With P(win)=0.90 and min_edge=0.05 this gives max_price=0.85,
-        # vs the old signal_price of ~0.49. Far more likely to get filled.
-        max_price = round(min(prob_win - self.min_edge, 0.95), 2)
+        # If estimated_prob is significantly above market_price (edge >= high_edge_threshold),
+        # add a 2% buffer to improve fill probability without sacrificing positive EV.
+        price_buffer = 0.02 if edge >= self.high_edge_threshold else 0.0
+        max_price = round(min(prob_win - self.min_edge + price_buffer, 0.95), 2)
 
         log.info(
             f"SCALP | {side} @ ${market_price:.2f} (max ${max_price:.2f}) | "
             f"Delta: {delta*100:+.3f}% | Vol: {vol*100:.4f}% | "
             f"P(win): {prob_win:.2f} | Edge: {net_edge:.3f} | "
+            f"Buffer: {'+2%' if price_buffer else 'none'} | "
             f"Bet: ${bet_amount:.2f}"
         )
 

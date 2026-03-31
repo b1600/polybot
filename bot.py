@@ -5,9 +5,9 @@
 #   T-180 → T-90:  Fade extreme spikes (opportunistic, taker FAK)
 #   T-150 → T-10:  Late-window scalp — single-shot taker execution:
 #                    1. Check order book depth — skip if no asks (illiquid)
-#                    2. Place one FAK taker at market, capped at max_price
+#                    2. Place one IOC order, capped at max_price
 #                       (prob_win - min_edge) to keep positive EV
-#                    No GTC maker, no polling loop, no FAK rescue chain.
+#                    No GTC maker, no polling loop, no retry chain.
 # ─────────────────────────────────────────────────────────
 
 import asyncio
@@ -30,6 +30,7 @@ from strategy_v2 import CombinedStrategy
 from executor import (
     init_client,
     place_market_order,
+    place_ioc_order,
     cancel_all,
     get_usdc_balance,
     get_ask_depth,
@@ -368,14 +369,14 @@ class TradingBot:
         self.window.trades.append(trade_record)
         self.trade_log.append(trade_record)
 
-    # ── Execution: Scalp (single-shot FAK taker) ──────────────────────
+    # ── Execution: Scalp (single-shot IOC taker) ──────────────────────
 
     async def _execute_scalp(self, trade: dict):
         """
         Single-shot taker scalp:
         1. Check order book depth — skip if no asks (illiquid).
-        2. Place one FAK at market, capped at max_price to keep positive EV.
-        No GTC, no polling, no FAK rescue chain.
+        2. Place one IOC order, capped at max_price to keep positive EV.
+        No GTC, no polling, no retry chain.
         """
         token_id = trade["token_id"]
         bet_amount = trade["bet_amount"]
@@ -400,9 +401,9 @@ class TradingBot:
             except Exception as e:
                 log.warning(f"SCALP | Book depth check failed: {e} — proceeding anyway")
 
-            # ── Single FAK taker order ───────────────────────────
+            # ── Single IOC order ─────────────────────────────────
             try:
-                resp = place_market_order(
+                resp = place_ioc_order(
                     self.client, token_id, bet_amount, price=max_price
                 )
                 order_id = resp.get("orderID") or resp.get("id")
@@ -411,15 +412,15 @@ class TradingBot:
                 )
                 if size_matched > 0:
                     log.info(
-                        f"SCALP | FAK filled ${size_matched:.2f} | Order: {order_id}"
+                        f"SCALP | IOC filled ${size_matched:.2f} | Order: {order_id}"
                     )
                 else:
                     log.info(
-                        f"SCALP | FAK no fill at max ${max_price:.2f} — skipped"
+                        f"SCALP | IOC no fill at max ${max_price:.2f} — skipped"
                     )
                     order_id = None
             except Exception as e:
-                log.error(f"SCALP | FAK placement failed: {e}")
+                log.error(f"SCALP | IOC placement failed: {e}")
                 return
 
         trade_record = {

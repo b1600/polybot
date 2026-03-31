@@ -89,12 +89,34 @@ def get_ask_depth(client, token_id) -> list:
 
 def place_market_order(client, token_id, amount, price=0):
     """
-    Place a FAK (Fill-and-Kill = IOC) market order.
+    Place a FAK (Fill-and-Kill) market order.
     Fills as much as possible at or below `price`, cancels the rest.
     Accepts partial fills — better than FOK when liquidity is thin.
 
     price=0  → SDK auto-calculates from the live order book (sweeps best ask).
     price>0  → acts as a worst-case price cap (for walk-up retries).
+    amount is in USD (USDC).
+    """
+    market_args = MarketOrderArgs(
+        token_id=token_id,
+        amount=amount,
+        side=BUY,
+        order_type=OrderType.FAK,
+        price=price,
+    )
+    signed_order = client.create_market_order(market_args)
+    resp = client.post_order(signed_order, OrderType.FAK)
+    return resp
+
+def place_ioc_order(client, token_id, amount, price=0):
+    """
+    Place an IOC (Immediate-or-Cancel) order for the scalp strategy.
+    Fills as much as possible at or below `price`, cancels any unfilled remainder.
+    Accepts partial fills — used when we need a price cap to preserve positive EV.
+
+    The Polymarket CLOB SDK maps IOC to OrderType.FAK internally.
+    price=0  → sweeps best ask.
+    price>0  → worst-case price cap (scalp uses prob_win - min_edge).
     amount is in USD (USDC).
     """
     market_args = MarketOrderArgs(
