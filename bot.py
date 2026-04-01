@@ -3,7 +3,7 @@
 # Three strategies fire at different phases:
 #   T-120 → T-90:  Early momentum (directional, taker FAK)
 #   T-180 → T-90:  Fade extreme spikes (opportunistic, taker FAK)
-#   T-150 → T-10:  Late-window scalp — single-shot taker execution:
+#   T-220 → T-10:  Late-window scalp — single-shot taker execution:
 #                    1. Check order book depth — skip if no asks (illiquid)
 #                    2. Place one IOC order, capped at max_price
 #                       (prob_win - min_edge) to keep positive EV
@@ -425,6 +425,20 @@ class TradingBot:
                 size_matched = float(
                     resp.get("size_matched") or resp.get("filled") or 0
                 )
+
+                # The CLOB sometimes returns size_matched=0 in the immediate
+                # POST response even when the IOC filled (match is async).
+                # If size_matched is ambiguous and we have an order_id, do one
+                # follow-up status fetch to get the confirmed fill amount.
+                if size_matched == 0 and order_id:
+                    try:
+                        status = get_order_status(self.client, order_id)
+                        size_matched = float(
+                            status.get("size_matched") or status.get("filled") or 0
+                        )
+                    except Exception as e:
+                        log.warning(f"SCALP | Order status fetch failed: {e}")
+
                 if size_matched > 0:
                     log.info(
                         f"SCALP | IOC filled ${size_matched:.2f} | Order: {order_id}"

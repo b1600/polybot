@@ -11,9 +11,9 @@
 #    Buy the cheap side when market price is extreme (>0.85) AND
 #    the move looks like a spike (5s vol >> 60s vol). Taker order.
 #
-# C) Mid-Window Scalp (T-150 to T-10):
+# C) Mid-Window Scalp (T-220 to T-10):
 #    Single-shot IOC taker bet after checking order book depth.
-#    Enters at T-150 before counter-parties reprice away from the current ask.
+#    Enters at T-220 before counter-parties reprice away from the current ask.
 #    Caps the fill price at prob_win - min_edge to preserve positive EV.
 #    Skips if the book has no asks (illiquid market).
 #
@@ -240,7 +240,7 @@ class FadeExtremeStrategy:
 # ═══════════════════════════════════════════════════════════
 #
 # At T-90 the order book still has resting asks from market makers.
-# By T-30 those asks are gone. So we enter at T-150 with a single IOC order.
+# By T-30 those asks are gone. So we enter at T-220 with a single IOC order.
 # Stops at T-10 to leave time for the order to process.
 
 class LateScalpStrategy:
@@ -260,7 +260,7 @@ class LateScalpStrategy:
         min_bet: float = 2.50,            # IOC: match GTC floor for consistency
         min_shares: int = 5,              # Polymarket CLOB minimum
         max_bet_pct: float = 0.10,        # max 10% of bankroll
-        entry_window_seconds: int = 150,  # act in last 150s — enter before market reprices
+        entry_window_seconds: int = 220,  # act in last 220s — enter before market reprices
     ):
         self.min_delta_pct = min_delta_pct
         self.kelly_fraction = kelly_fraction
@@ -401,8 +401,8 @@ class CombinedStrategy:
             if trade:
                 return ("fade", trade)
 
-        # Phase 3: Mid-window scalp (T-150 to T-10) — enter before market reprices
-        if seconds_remaining <= 150:
+        # Phase 3: Mid-window scalp (T-220 to T-10) — enter before market reprices
+        if seconds_remaining <= 220:
             trade = self.scalp.evaluate(
                 market, bankroll, price_feed, seconds_remaining
             )
