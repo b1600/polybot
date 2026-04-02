@@ -105,7 +105,7 @@ log = logging.getLogger("bot")
 # ── Configuration ──────────────────────────────────────────
 
 EVAL_INTERVAL = 5       # seconds between strategy evaluations within a window
-RESOLUTION_WAIT = 60    # seconds after window close before checking outcome (allows oracle to post resolution on-chain)
+RESOLUTION_WAIT = 120   # seconds after window close before checking outcome (allows oracle to post resolution on-chain)
 MAX_TRADES_PER_WINDOW = 3  # hard cap: at most one of each strategy per window
 DAILY_LOSS_LIMIT_PCT = 0.25  # stop trading if down 25% from session start
 
