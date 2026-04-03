@@ -417,6 +417,7 @@ class TradingBot:
                 log.warning(f"SCALP | Book depth check failed: {e} — proceeding anyway")
 
             # ── Single IOC order ─────────────────────────────────
+            ioc_filled = False
             try:
                 resp = place_ioc_order(
                     self.client, token_id, bet_amount, price=max_price
@@ -440,6 +441,7 @@ class TradingBot:
                         log.warning(f"SCALP | Order status fetch failed: {e}")
 
                 if size_matched > 0:
+                    ioc_filled = True
                     log.info(
                         f"SCALP | IOC filled ${size_matched:.2f} | Order: {order_id}"
                     )
@@ -448,46 +450,48 @@ class TradingBot:
                         f"SCALP | IOC no fill at max ${max_price:.2f} — attempting GTC fallback"
                     )
                     order_id = None
-                    # Place a resting GTC limit at the current best ask so we become
-                    # the liquidity rather than chasing it. Any taker entering the
-                    # market before window close will cross us.
-                    try:
-                        current_asks = get_ask_depth(self.client, token_id)
-                        if current_asks:
-                            best_ask = float(current_asks[0].price)
-                            gtc_shares = trade["shares"]
-                            gtc_resp = place_maker_order(
-                                self.client, token_id, price=best_ask, size=gtc_shares
-                            )
-                            gtc_order_id = gtc_resp.get("orderID") or gtc_resp.get("id")
-                            log.info(
-                                f"SCALP | GTC fallback resting @ ${best_ask:.2f} | "
-                                f"{gtc_shares} shares | Order: {gtc_order_id}"
-                            )
-                            gtc_record = {
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                                "window": self.window.window_start,
-                                "slug": self.window.slug,
-                                "order_id": gtc_order_id,
-                                "status": "pending",
-                                **trade,
-                                "price": best_ask,
-                                "maker_price": best_ask,
-                                "bet_amount": round(gtc_shares * best_ask, 2),
-                                "use_maker": True,
-                                "strategy": "scalp_gtc",
-                                "bankroll_before": self.bankroll,
-                            }
-                            self.window.trades.append(gtc_record)
-                            self.trade_log.append(gtc_record)
-                            return  # GTC placed — IOC miss not worth recording
-                        else:
-                            log.info("SCALP | GTC fallback skipped — no asks in book")
-                    except Exception as e:
-                        log.error(f"SCALP | GTC fallback failed: {e}")
             except Exception as e:
-                log.error(f"SCALP | IOC placement failed: {e}")
-                return
+                log.error(f"SCALP | IOC placement failed: {e} — attempting GTC fallback")
+
+            # ── GTC fallback if IOC didn't fill ──────────────────
+            # Triggers whether the IOC returned no-fill OR threw an exception.
+            # Posts a resting limit at the current best ask — becomes the
+            # liquidity rather than chasing it.
+            if not ioc_filled:
+                try:
+                    current_asks = get_ask_depth(self.client, token_id)
+                    if current_asks:
+                        best_ask = float(current_asks[0].price)
+                        gtc_shares = trade["shares"]
+                        gtc_resp = place_maker_order(
+                            self.client, token_id, price=best_ask, size=gtc_shares
+                        )
+                        gtc_order_id = gtc_resp.get("orderID") or gtc_resp.get("id")
+                        log.info(
+                            f"SCALP | GTC fallback resting @ ${best_ask:.2f} | "
+                            f"{gtc_shares} shares | Order: {gtc_order_id}"
+                        )
+                        gtc_record = {
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "window": self.window.window_start,
+                            "slug": self.window.slug,
+                            "order_id": gtc_order_id,
+                            "status": "pending",
+                            **trade,
+                            "price": best_ask,
+                            "maker_price": best_ask,
+                            "bet_amount": round(gtc_shares * best_ask, 2),
+                            "use_maker": True,
+                            "strategy": "scalp_gtc",
+                            "bankroll_before": self.bankroll,
+                        }
+                        self.window.trades.append(gtc_record)
+                        self.trade_log.append(gtc_record)
+                        return  # GTC placed — IOC miss not worth recording
+                    else:
+                        log.info("SCALP | GTC fallback skipped — no asks in book")
+                except Exception as e:
+                    log.error(f"SCALP | GTC fallback failed: {e}")
 
         trade_record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
