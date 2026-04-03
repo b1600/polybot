@@ -324,16 +324,17 @@ class LateScalpStrategy:
         bet_amount = round(shares * market_price, 2)
 
         # Max price we'll pay as a taker — keeps at least min_edge positive EV.
-        # If estimated_prob is significantly above market_price (edge >= high_edge_threshold),
-        # add a 2% buffer to improve fill probability without sacrificing positive EV.
-        price_buffer = 0.02 if edge >= self.high_edge_threshold else 0.0
+        # Buffer absorbs the ~1s submission latency where the best ask can move
+        # 1-3 ticks above the cap before the FAK reaches the matching engine.
+        # High-edge trades get a slightly larger buffer since there's more room.
+        price_buffer = 0.04 if edge >= self.high_edge_threshold else 0.03
         max_price = round(min(prob_win - self.min_edge + price_buffer, 0.95), 2)
 
         log.info(
             f"SCALP | {side} @ ${market_price:.2f} (max ${max_price:.2f}) | "
             f"Delta: {delta*100:+.3f}% | Vol: {vol*100:.4f}% | "
             f"P(win): {prob_win:.2f} | Edge: {net_edge:.3f} | "
-            f"Buffer: {'+2%' if price_buffer else 'none'} | "
+            f"Buffer: +{int(price_buffer*100)}% | "
             f"Shares: {shares} | Bet: ${bet_amount:.2f}"
         )
 
