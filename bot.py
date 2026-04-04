@@ -37,6 +37,7 @@ from executor import (
     get_ask_depth,
     get_order_status,
     redeem_positions,
+    ConditionNotResolved,
 )
 
 load_dotenv()
@@ -104,10 +105,15 @@ log = logging.getLogger("bot")
 
 # ── Configuration ──────────────────────────────────────────
 
-EVAL_INTERVAL = 5       # seconds between strategy evaluations within a window
-RESOLUTION_WAIT = 120   # seconds after window close before checking outcome (allows oracle to post resolution on-chain)
+EVAL_INTERVAL = 5        # seconds between strategy evaluations within a window
+RESOLUTION_WAIT = 480    # seconds after window close before first redeem attempt (8 min — oracle typically resolves in 5–15 min)
 MAX_TRADES_PER_WINDOW = 3  # hard cap: at most one of each strategy per window
 DAILY_LOSS_LIMIT_PCT = 0.25  # stop trading if down 25% from session start
+
+# Retry schedule for redeem after ConditionNotResolved. Each value is the
+# number of seconds to wait before the next attempt. Attempts fire at roughly:
+# T+8min, T+12min, T+20min, T+35min, T+60min — spanning the realistic oracle window.
+_REDEEM_RETRY_DELAYS = [240, 480, 900, 1500]  # 4 min, 8 min, 15 min, 25 min
 
 
 
@@ -647,11 +653,12 @@ class TradingBot:
         Runs only in live mode. Skips silently if condition_id is unavailable
         (e.g. market fetch failed all window) or if there were no wins.
 
-        The market must have resolved on-chain before redemption succeeds.
-        We already wait RESOLUTION_WAIT seconds after window close before
-        reaching this point, which is normally sufficient. If the chain hasn't
-        settled yet the call will revert and we log an error — the tokens stay
-        in the wallet and Polymarket's own sweeper will eventually redeem them.
+        Strategy 1: First attempt fires after RESOLUTION_WAIT (8 min).
+        Strategy 2: On ConditionNotResolved, retries on a long-tail schedule
+                    (_REDEEM_RETRY_DELAYS) using asyncio.sleep so the event
+                    loop stays alive between attempts.
+        Strategy 3: Each attempt is pre-checked via eth_call simulation in
+                    redeem_positions() — no gas spent if oracle not ready.
         """
         if self.dry_run or not self.window:
             return
@@ -679,18 +686,38 @@ class TradingBot:
             seen.add(outcome_index)
 
             strategy = trade.get("strategy", "?")
-            try:
-                tx_hash = redeem_positions(condition_id, outcome_index)
-                log.info(
-                    f"REDEEM | {strategy} {trade['side']} | "
-                    f"Condition: …{condition_id[-8:]} | "
-                    f"Tx: {tx_hash}"
-                )
-            except Exception as e:
-                log.error(
-                    f"REDEEM FAILED | {strategy} {trade['side']} | "
-                    f"Condition: {condition_id} | {e}"
-                )
+            max_attempts = len(_REDEEM_RETRY_DELAYS) + 1
+
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    tx_hash = redeem_positions(condition_id, outcome_index)
+                    log.info(
+                        f"REDEEM | {strategy} {trade['side']} | "
+                        f"attempt {attempt}/{max_attempts} | "
+                        f"Condition: …{condition_id[-8:]} | Tx: {tx_hash}"
+                    )
+                    break  # success — move on
+                except ConditionNotResolved as e:
+                    if attempt < max_attempts:
+                        delay = _REDEEM_RETRY_DELAYS[attempt - 1]
+                        log.warning(
+                            f"REDEEM | {strategy} {trade['side']} | "
+                            f"attempt {attempt}/{max_attempts} | oracle not yet resolved, "
+                            f"retry in {delay // 60}m — {e}"
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        log.error(
+                            f"REDEEM FAILED | {strategy} {trade['side']} | "
+                            f"oracle not resolved after all {max_attempts} attempts | "
+                            f"Condition: {condition_id}"
+                        )
+                except Exception as e:
+                    log.error(
+                        f"REDEEM FAILED | {strategy} {trade['side']} | "
+                        f"Condition: {condition_id} | {e}"
+                    )
+                    break  # unexpected error — don't retry
 
     # ── Bankroll sync ──────────────────────────────────────
 

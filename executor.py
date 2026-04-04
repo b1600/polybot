@@ -30,20 +30,23 @@ _REDEEM_ABI = [
 ]
 
 
-def redeem_positions(condition_id: str, outcome_index: int, retries: int = 3, retry_delay: int = 10) -> str:
+class ConditionNotResolved(Exception):
+    """Raised when the on-chain oracle has not yet resolved the condition."""
+
+
+def redeem_positions(condition_id: str, outcome_index: int) -> str:
     """
-    Redeem winning NegRisk CTF tokens for USDC.e on-chain.
+    Redeem winning NegRisk CTF tokens for USDC.e on-chain. Single attempt.
 
     condition_id   : hex string (with or without 0x prefix) from Gamma API
     outcome_index  : 0 for the first outcome (e.g. "Up"), 1 for the second ("Down")
                      Maps to CTF indexSet: 0 → 1, 1 → 2
-    retries        : number of retry attempts if the tx reverts (oracle not yet resolved)
-    retry_delay    : seconds to wait between retries
 
-    Returns the confirmed transaction hash.
-    Raises on revert or timeout after all attempts exhausted.
+    Raises ConditionNotResolved if the oracle has not yet settled on-chain
+    (detected via eth_call simulation — no gas spent).
+    Raises RuntimeError if the tx is broadcast but reverts (rare race condition).
+    Returns the confirmed transaction hash on success.
     """
-    import time
     from web3 import Web3
 
     rpc = os.getenv(
@@ -61,36 +64,38 @@ def redeem_positions(condition_id: str, outcome_index: int, retries: int = 3, re
     condition_bytes = bytes.fromhex(condition_id.removeprefix("0x"))
     index_set = 1 << outcome_index  # outcome 0 → 1, outcome 1 → 2
 
-    last_error = None
-    for attempt in range(1, retries + 2):  # +1 for the initial attempt
-        nonce = w3.eth.get_transaction_count(account.address, "pending")
-        gas_price = int(w3.eth.gas_price * 1.2)  # 20% above current base fee
-
-        tx = adapter.functions.redeemPositions(
-            condition_bytes, [index_set]
-        ).build_transaction({
-            "from": account.address,
-            "nonce": nonce,
-            "gas": 250_000,
-            "gasPrice": gas_price,
-        })
-        signed = account.sign_transaction(tx)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-        if receipt.status == 1:
-            return tx_hash.hex()
-
-        last_error = (
-            f"redeemPositions reverted — condition: {condition_id} "
-            f"indexSet: {index_set} tx: {tx_hash.hex()}"
+    # ── Strategy 3: pre-check via eth_call — no gas wasted if not resolved ──
+    try:
+        adapter.functions.redeemPositions(condition_bytes, [index_set]).call(
+            {"from": account.address}
         )
-        if attempt <= retries:
-            log.warning(
-                f"REDEEM attempt {attempt}/{retries} reverted, retrying in {retry_delay}s — {last_error}"
-            )
-            time.sleep(retry_delay)
+    except Exception as sim_err:
+        raise ConditionNotResolved(
+            f"condition: {condition_id} indexSet: {index_set} | {sim_err}"
+        )
 
-    raise RuntimeError(last_error)
+    # Simulation passed — send the real transaction
+    nonce = w3.eth.get_transaction_count(account.address, "pending")
+    gas_price = int(w3.eth.gas_price * 1.2)  # 20% above current base fee
+
+    tx = adapter.functions.redeemPositions(
+        condition_bytes, [index_set]
+    ).build_transaction({
+        "from": account.address,
+        "nonce": nonce,
+        "gas": 250_000,
+        "gasPrice": gas_price,
+    })
+    signed = account.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+    if receipt.status == 1:
+        return tx_hash.hex()
+
+    raise RuntimeError(
+        f"redeemPositions reverted after passing simulation — "
+        f"condition: {condition_id} indexSet: {index_set} tx: {tx_hash.hex()}"
+    )
 
 
 def get_usdc_balance(client) -> float:
