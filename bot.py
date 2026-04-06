@@ -37,7 +37,7 @@ from executor import (
     get_ask_depth,
     get_order_status,
     redeem_positions,
-    ConditionNotResolved,
+    fetch_redeemable_positions,
 )
 
 load_dotenv()
@@ -110,10 +110,8 @@ RESOLUTION_WAIT = 480    # seconds after window close before first redeem attemp
 MAX_TRADES_PER_WINDOW = 3  # hard cap: at most one of each strategy per window
 DAILY_LOSS_LIMIT_PCT = 0.25  # stop trading if down 25% from session start
 
-# Retry schedule for redeem after ConditionNotResolved. Each value is the
-# number of seconds to wait before the next attempt. Attempts fire at roughly:
-# T+8min, T+12min, T+20min, T+35min, T+60min — spanning the realistic oracle window.
-_REDEEM_RETRY_DELAYS = [240, 480, 900, 1500]  # 4 min, 8 min, 15 min, 25 min
+REDEEM_POLL_INTERVAL = 600   # seconds between Data API polls for oracle readiness (10 min)
+REDEEM_MAX_AGE = 86400       # give up on a pending redemption after 24h
 
 
 
@@ -192,6 +190,8 @@ class TradingBot:
             log.error("Binance price feed failed to connect. Exiting.")
             await self.price_feed.stop()
             return
+
+        asyncio.create_task(self._startup_redeem_sweep())
 
         while True:
             try:
@@ -647,18 +647,11 @@ class TradingBot:
 
     async def _redeem_wins(self):
         """
-        For each winning trade this window, call redeemPositions on-chain so
-        the USDC.e flows back to the proxy wallet and is available next window.
+        For each winning trade this window, spawn a background task that polls
+        the Polymarket Data API until the oracle resolves, then redeems on-chain.
 
-        Runs only in live mode. Skips silently if condition_id is unavailable
-        (e.g. market fetch failed all window) or if there were no wins.
-
-        Strategy 1: First attempt fires after RESOLUTION_WAIT (8 min).
-        Strategy 2: On ConditionNotResolved, retries on a long-tail schedule
-                    (_REDEEM_RETRY_DELAYS) using asyncio.sleep so the event
-                    loop stays alive between attempts.
-        Strategy 3: Each attempt is pre-checked via eth_call simulation in
-                    redeem_positions() — no gas spent if oracle not ready.
+        Returns immediately — the window loop is not blocked. Each background
+        task retries every REDEEM_POLL_INTERVAL seconds for up to REDEEM_MAX_AGE.
         """
         if self.dry_run or not self.window:
             return
@@ -676,48 +669,92 @@ class TradingBot:
         if not winning_trades:
             return
 
-        # De-duplicate: only one redemption call per outcome_index is needed
-        # even if somehow two trades landed on the same side.
         seen: set[int] = set()
+        deadline = time.time() + REDEEM_MAX_AGE
         for trade in winning_trades:
             outcome_index = trade["outcome_index"]
             if outcome_index in seen:
                 continue
             seen.add(outcome_index)
+            label = f"{trade.get('strategy', '?')} {trade['side']}"
+            asyncio.create_task(
+                self._redeem_background(condition_id, outcome_index, label, deadline)
+            )
 
-            strategy = trade.get("strategy", "?")
-            max_attempts = len(_REDEEM_RETRY_DELAYS) + 1
-
-            for attempt in range(1, max_attempts + 1):
-                try:
-                    tx_hash = redeem_positions(condition_id, outcome_index)
-                    log.info(
-                        f"REDEEM | {strategy} {trade['side']} | "
-                        f"attempt {attempt}/{max_attempts} | "
-                        f"Condition: …{condition_id[-8:]} | Tx: {tx_hash}"
+    async def _redeem_background(
+        self, condition_id: str, outcome_index: int, label: str, deadline: float
+    ):
+        """
+        Background task: polls Data API every REDEEM_POLL_INTERVAL seconds until
+        the position appears as redeemable, then executes on-chain redemption.
+        Gives up when deadline (REDEEM_MAX_AGE from trade time) is reached.
+        """
+        funder = os.getenv("POLY_FUNDER_ADDRESS", "")
+        attempt = 0
+        while time.time() < deadline:
+            attempt += 1
+            try:
+                positions = await asyncio.to_thread(fetch_redeemable_positions, funder)
+                match = next(
+                    (p for p in positions
+                     if p["condition_id"].lower() == condition_id.lower()),
+                    None,
+                )
+                if match is None:
+                    log.warning(
+                        f"REDEEM | {label} | attempt {attempt} | "
+                        f"oracle not yet resolved, retry in {REDEEM_POLL_INTERVAL // 60}m"
                     )
-                    break  # success — move on
-                except ConditionNotResolved as e:
-                    if attempt < max_attempts:
-                        delay = _REDEEM_RETRY_DELAYS[attempt - 1]
-                        log.warning(
-                            f"REDEEM | {strategy} {trade['side']} | "
-                            f"attempt {attempt}/{max_attempts} | oracle not yet resolved, "
-                            f"retry in {delay // 60}m — {e}"
-                        )
-                        await asyncio.sleep(delay)
-                    else:
-                        log.error(
-                            f"REDEEM FAILED | {strategy} {trade['side']} | "
-                            f"oracle not resolved after all {max_attempts} attempts | "
-                            f"Condition: {condition_id}"
-                        )
+                    await asyncio.sleep(REDEEM_POLL_INTERVAL)
+                    continue
+
+                tx_hash = await asyncio.to_thread(
+                    redeem_positions, condition_id, outcome_index
+                )
+                log.info(
+                    f"REDEEM | {label} | attempt {attempt} | "
+                    f"Condition: …{condition_id[-8:]} | Tx: {tx_hash}"
+                )
+                return
+            except Exception as e:
+                log.error(f"REDEEM FAILED | {label} | Condition: {condition_id} | {e}")
+                return  # unexpected error — don't retry
+
+        log.error(
+            f"REDEEM FAILED | {label} | oracle not resolved after 24h | "
+            f"Condition: {condition_id}"
+        )
+
+    async def _startup_redeem_sweep(self):
+        """
+        On bot startup, redeem any positions the Data API reports as already
+        redeemable. Recovers positions stranded by exhausted retries, crashes,
+        or restarts in previous sessions.
+        """
+        if self.dry_run:
+            return
+        funder = os.getenv("POLY_FUNDER_ADDRESS", "")
+        if not funder:
+            return
+        try:
+            positions = await asyncio.to_thread(fetch_redeemable_positions, funder)
+            if not positions:
+                return
+            log.info(f"STARTUP SWEEP | Found {len(positions)} redeemable position(s)")
+            for p in positions:
+                try:
+                    tx_hash = await asyncio.to_thread(
+                        redeem_positions, p["condition_id"], p["outcome_index"]
+                    )
+                    log.info(
+                        f"STARTUP SWEEP | Redeemed {p['title']} | Tx: {tx_hash}"
+                    )
                 except Exception as e:
                     log.error(
-                        f"REDEEM FAILED | {strategy} {trade['side']} | "
-                        f"Condition: {condition_id} | {e}"
+                        f"STARTUP SWEEP | Failed to redeem {p['title']}: {e}"
                     )
-                    break  # unexpected error — don't retry
+        except Exception as e:
+            log.error(f"STARTUP SWEEP | Error: {e}")
 
     # ── Bankroll sync ──────────────────────────────────────
 

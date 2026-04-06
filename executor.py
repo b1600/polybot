@@ -30,21 +30,59 @@ _REDEEM_ABI = [
 ]
 
 
-class ConditionNotResolved(Exception):
-    """Raised when the on-chain oracle has not yet resolved the condition."""
+def fetch_redeemable_positions(funder_address: str) -> list[dict]:
+    """
+    Query the Polymarket Data API for all positions where the oracle has resolved
+    and tokens are still held (i.e. ready to redeem).
+
+    Returns a list of dicts with keys: condition_id, outcome_index, size, title.
+    Returns [] on any error so callers can proceed safely.
+    """
+    import requests
+    try:
+        resp = requests.get(
+            "https://data-api.polymarket.com/positions",
+            params={"user": funder_address, "redeemable": "true", "sizeThreshold": 0},
+            timeout=15,
+        )
+        if resp.status_code in (429, 1015):
+            log.warning("fetch_redeemable_positions: Data API rate limited")
+            return []
+        positions = resp.json()
+    except Exception as e:
+        log.warning(f"fetch_redeemable_positions failed: {e}")
+        return []
+
+    result = []
+    for p in positions:
+        if float(p.get("size", 0)) <= 0:
+            continue
+        cid = p.get("conditionId", p.get("condition_id", ""))
+        if not cid:
+            continue
+        if not cid.startswith("0x"):
+            cid = "0x" + cid
+        result.append({
+            "condition_id": cid,
+            "outcome_index": int(p.get("outcomeIndex", 0)),
+            "size": float(p.get("size", 0)),
+            "title": p.get("title", cid[:12]),
+        })
+    return result
 
 
 def redeem_positions(condition_id: str, outcome_index: int) -> str:
     """
     Redeem winning NegRisk CTF tokens for USDC.e on-chain. Single attempt.
 
+    Call this only after confirming the oracle has resolved via
+    fetch_redeemable_positions() — the Data API is the readiness signal.
+
     condition_id   : hex string (with or without 0x prefix) from Gamma API
     outcome_index  : 0 for the first outcome (e.g. "Up"), 1 for the second ("Down")
                      Maps to CTF indexSet: 0 → 1, 1 → 2
 
-    Raises ConditionNotResolved if the oracle has not yet settled on-chain
-    (detected via eth_call simulation — no gas spent).
-    Raises RuntimeError if the tx is broadcast but reverts (rare race condition).
+    Raises RuntimeError if the tx reverts on-chain.
     Returns the confirmed transaction hash on success.
     """
     from web3 import Web3
@@ -64,17 +102,6 @@ def redeem_positions(condition_id: str, outcome_index: int) -> str:
     condition_bytes = bytes.fromhex(condition_id.removeprefix("0x"))
     index_set = 1 << outcome_index  # outcome 0 → 1, outcome 1 → 2
 
-    # ── Strategy 3: pre-check via eth_call — no gas wasted if not resolved ──
-    try:
-        adapter.functions.redeemPositions(condition_bytes, [index_set]).call(
-            {"from": account.address}
-        )
-    except Exception as sim_err:
-        raise ConditionNotResolved(
-            f"condition: {condition_id} indexSet: {index_set} | {sim_err}"
-        )
-
-    # Simulation passed — send the real transaction
     nonce = w3.eth.get_transaction_count(account.address, "pending")
     gas_price = int(w3.eth.gas_price * 1.2)  # 20% above current base fee
 
@@ -93,7 +120,7 @@ def redeem_positions(condition_id: str, outcome_index: int) -> str:
         return tx_hash.hex()
 
     raise RuntimeError(
-        f"redeemPositions reverted after passing simulation — "
+        f"redeemPositions reverted — "
         f"condition: {condition_id} indexSet: {index_set} tx: {tx_hash.hex()}"
     )
 
