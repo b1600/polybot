@@ -29,6 +29,25 @@ _REDEEM_ABI = [
     }
 ]
 
+# Polymarket browser-wallet proxy: lets the funder EOA execute calls on behalf
+# of the proxy wallet (which is msg.sender when it calls NegRiskAdapter).
+_PROXY_WALLET_ABI = [
+    {
+        "inputs": [
+            {"name": "_to", "type": "address"},
+            {"name": "_value", "type": "uint256"},
+            {"name": "_data", "type": "bytes"},
+        ],
+        "name": "execute",
+        "outputs": [
+            {"name": "_success", "type": "bool"},
+            {"name": "_result", "type": "bytes"},
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    }
+]
+
 
 def fetch_redeemable_positions(funder_address: str) -> list[dict]:
     """
@@ -92,25 +111,33 @@ def redeem_positions(condition_id: str, outcome_index: int) -> str:
         "https://polygon-mainnet.g.alchemy.com/v2/" + os.getenv("ALCHEMY_API_KEY", ""),
     )
     w3 = Web3(Web3.HTTPProvider(rpc))
+    # Funder EOA: signs and pays gas, but does NOT hold the CTF tokens.
     account = w3.eth.account.from_key(os.getenv("POLY_PRIVATE_KEY"))
+    # Proxy wallet: holds the CTF tokens and must be msg.sender for redeemPositions.
+    proxy_address = Web3.to_checksum_address(os.getenv("POLY_FUNDER_ADDRESS"))
 
     adapter = w3.eth.contract(
         address=Web3.to_checksum_address(_NEG_RISK_ADAPTER),
         abi=_REDEEM_ABI,
     )
+    proxy = w3.eth.contract(address=proxy_address, abi=_PROXY_WALLET_ABI)
 
     condition_bytes = bytes.fromhex(condition_id.removeprefix("0x"))
     index_set = 1 << outcome_index  # outcome 0 → 1, outcome 1 → 2
 
+    # Encode the redeemPositions call that the proxy wallet will forward.
+    redeem_data = adapter.encode_abi("redeemPositions", [condition_bytes, [index_set]])
+
     nonce = w3.eth.get_transaction_count(account.address, "pending")
     gas_price = int(w3.eth.gas_price * 1.2)  # 20% above current base fee
 
-    tx = adapter.functions.redeemPositions(
-        condition_bytes, [index_set]
+    # Funder EOA calls proxy.execute() → proxy calls adapter.redeemPositions() as msg.sender.
+    tx = proxy.functions.execute(
+        Web3.to_checksum_address(_NEG_RISK_ADAPTER), 0, redeem_data
     ).build_transaction({
         "from": account.address,
         "nonce": nonce,
-        "gas": 250_000,
+        "gas": 300_000,
         "gasPrice": gas_price,
     })
     signed = account.sign_transaction(tx)
