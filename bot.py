@@ -687,19 +687,27 @@ class TradingBot:
         """
         Background task: polls Data API every REDEEM_POLL_INTERVAL seconds until
         the position appears as redeemable, then executes on-chain redemption.
-        Gives up when deadline (REDEEM_MAX_AGE from trade time) is reached.
         """
+        # === CRITICAL FIX: Normalize condition_id exactly like fetch_redeemable_positions does ===
+        if condition_id:
+            condition_id = condition_id.removeprefix("0x").removeprefix("0X").lower()
+            condition_id = f"0x{condition_id}"
+
         funder = os.getenv("POLY_FUNDER_ADDRESS", "")
         attempt = 0
         while time.time() < deadline:
             attempt += 1
             try:
                 positions = await asyncio.to_thread(fetch_redeemable_positions, funder)
+                
+                # Debug log (remove after verification)
+                log.debug(f"REDEEM | comparing: window={condition_id} | API={[p['condition_id'] for p in positions]}")
+
                 match = next(
                     (p for p in positions
-                     if p["condition_id"].lower() == condition_id.lower()),
-                    None,
+                    if p["condition_id"].lower() == condition_id.lower()), None
                 )
+
                 if match is None:
                     log.warning(
                         f"REDEEM | {label} | attempt {attempt} | "
@@ -712,8 +720,7 @@ class TradingBot:
                     redeem_positions, condition_id, outcome_index
                 )
                 log.info(
-                    f"REDEEM | {label} | attempt {attempt} | "
-                    f"Condition: …{condition_id[-8:]} | Tx: {tx_hash}"
+                    f"REDEEM | {label} | SUCCESS | Condition: …{condition_id[-8:]} | Tx: {tx_hash}"
                 )
                 return
             except Exception as e:
