@@ -191,7 +191,7 @@ class TradingBot:
             await self.price_feed.stop()
             return
 
-        asyncio.create_task(self._startup_redeem_sweep())
+        # asyncio.create_task(self._startup_redeem_sweep())  # disabled: another bot handles redeem
 
         while True:
             try:
@@ -285,7 +285,7 @@ class TradingBot:
         await self._resolve_window()
 
         # ── Redeem winning tokens on-chain → USDC.e back to proxy wallet ──
-        await self._redeem_wins()
+        # await self._redeem_wins()  # disabled: another bot handles redeem
 
         # ── Re-sync bankroll: catches fills missed by model ─
         await self._refresh_bankroll()
