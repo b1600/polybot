@@ -468,6 +468,11 @@ class TradingBot:
                     current_asks = get_ask_depth(self.client, token_id)
                     if current_asks:
                         best_ask = float(current_asks[0].price)
+                        if best_ask > max_price:
+                            log.info(
+                                f"SCALP | GTC fallback skipped — best ask ${best_ask:.2f} exceeds max ${max_price:.2f}"
+                            )
+                            return
                         gtc_shares = trade["shares"]
                         gtc_resp = place_maker_order(
                             self.client, token_id, price=best_ask, size=gtc_shares
