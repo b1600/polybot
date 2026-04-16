@@ -260,7 +260,7 @@ class LateScalpStrategy:
         min_bet: float = 2.50,            # IOC: match GTC floor for consistency
         min_shares: int = 5,              # Polymarket CLOB minimum
         max_bet_pct: float = 0.10,        # max 10% of bankroll
-        entry_window_seconds: int = 220,  # act in last 220s — enter before market reprices
+        entry_window_seconds: int = 270,  # act in last 270s — enter before market reprices
     ):
         self.min_delta_pct = min_delta_pct
         self.kelly_fraction = kelly_fraction
@@ -423,7 +423,7 @@ def _estimate_prob_from_delta(delta_pct, seconds_remaining, volatility):
 
     Normalises delta by remaining expected volatility (vol * sqrt(T))
     to get a z-score, then converts via normal CDF.
-    Clamped to [0.10, 0.90] — we're never that certain.
+    Clamped to [0.10, 0.80] — we're never that certain.
     """
     if volatility <= 0:
         volatility = 0.0001  # fallback: ~0.01% per second
@@ -435,7 +435,7 @@ def _estimate_prob_from_delta(delta_pct, seconds_remaining, volatility):
 
     z = delta_pct / remaining_vol
     prob_up = _normal_cdf(z)
-    return max(0.10, min(0.90, prob_up))
+    return max(0.10, min(0.80, prob_up))
 
 
 def _normal_cdf(x):

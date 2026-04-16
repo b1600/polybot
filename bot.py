@@ -174,6 +174,7 @@ class TradingBot:
         self.total_trades = 0
         self.wins = 0
         self.losses = 0
+        self._scalp_cooldown_until: float = 0.0
 
     # ── Main loop ──────────────────────────────────────────
 
@@ -213,11 +214,11 @@ class TradingBot:
         now = int(time.time())
         seconds_remaining = window_end - now
 
-        if seconds_remaining > 240:
+        if seconds_remaining > 290:
             # Too early in the window for any strategy — sleep
-            wait = seconds_remaining - 240
+            wait = seconds_remaining - 290
             log.info(
-                f"Window {window_start} | Waiting {wait}s until T-240"
+                f"Window {window_start} | Waiting {wait}s until T-290"
             )
             await asyncio.sleep(wait)
             return
@@ -343,8 +344,11 @@ class TradingBot:
                 self.window.fade_fired = True
 
             elif phase == "scalp" and not self.window.scalp_fired:
-                self.window.scalp_fired = True
-                await self._execute_scalp(result)
+                if time.time() < self._scalp_cooldown_until:
+                    pass  # cooldown active — skip this tick
+                else:
+                    self.window.scalp_fired = True
+                    await self._execute_scalp(result)
 
             # Sleep until next tick
             sleep_time = min(EVAL_INTERVAL, max(1, seconds_remaining - 3))
@@ -417,8 +421,26 @@ class TradingBot:
                 asks = get_ask_depth(self.client, token_id)
                 if not asks:
                     log.info("SCALP | No asks in book — skipping (illiquid)")
+                    self._scalp_cooldown_until = time.time() + 30
                     return
-                log.info(f"SCALP | Book has {len(asks)} ask level(s) — proceeding")
+                best_ask = float(asks[0].price)
+                # Ask-wall anomaly: single ask at near-certainty price = post-resolution book
+                if len(asks) == 1 and best_ask >= 0.95:
+                    log.info(
+                        f"SCALP | book_anomaly — single ask at ${best_ask:.2f}, "
+                        f"likely post-resolution book — skipping"
+                    )
+                    self._scalp_cooldown_until = time.time() + 30
+                    return
+                # Pre-sign gate: don't waste a signed order if fill is impossible
+                if best_ask > max_price:
+                    log.info(
+                        f"SCALP | Best ask ${best_ask:.2f} exceeds max ${max_price:.2f} "
+                        f"— skipping (no fill possible)"
+                    )
+                    self._scalp_cooldown_until = time.time() + 30
+                    return
+                log.info(f"SCALP | Book has {len(asks)} ask level(s), best ${best_ask:.2f} — proceeding")
             except Exception as e:
                 log.warning(f"SCALP | Book depth check failed: {e} — proceeding anyway")
 
