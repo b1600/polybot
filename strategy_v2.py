@@ -114,6 +114,10 @@ class EarlyMomentumStrategy:
         shares = max(self.min_shares, round(bet_amount / market_price, 1))
         bet_amount = round(shares * market_price, 2)
 
+        # Max price we'll accept — keeps at least min_edge positive EV
+        price_buffer = 0.04 if edge >= self.min_edge * 2 else 0.03
+        max_price = round(min(prob_win - self.min_edge + price_buffer, 0.95), 2)
+
         log.info(
             f"MOMENTUM | {side} @ ${market_price:.2f} | "
             f"Delta: {delta*100:+.3f}% | Vol: {vol*100:.4f}% | "
@@ -127,6 +131,7 @@ class EarlyMomentumStrategy:
             "outcome_index": market[side]["outcome_index"],
             "price": market_price,
             "maker_price": market_price,   # GTC limit bid at current ask
+            "max_price": max_price,
             "bet_amount": bet_amount,
             "shares": shares,
             "edge": round(net_edge, 4),
@@ -372,10 +377,12 @@ class CombinedStrategy:
         self.fade = FadeExtremeStrategy()
         self.scalp = LateScalpStrategy()
         self._momentum_fired = False
+        self._scalp_fired = False
 
     def on_new_window(self):
         """Reset state for a new 5-min window."""
         self._momentum_fired = False
+        self._scalp_fired = False
 
     def evaluate_phase(self, market, bankroll, price_feed, seconds_remaining):
         """
@@ -403,11 +410,12 @@ class CombinedStrategy:
                 return ("fade", trade)
 
         # Phase 3: Mid-window scalp (T-220 to T-10) — enter before market reprices
-        if seconds_remaining <= 220:
+        if seconds_remaining <= 220 and not self._scalp_fired:
             trade = self.scalp.evaluate(
                 market, bankroll, price_feed, seconds_remaining
             )
             if trade:
+                self._scalp_fired = True
                 return ("scalp", trade)
 
         return ("skip", None)

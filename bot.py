@@ -33,6 +33,7 @@ from executor import (
     place_market_order,
     place_ioc_order,
     cancel_all,
+    cancel_order,
     get_usdc_balance,
     get_ask_depth,
     get_order_status,
@@ -271,28 +272,10 @@ class TradingBot:
         # ── End-of-window cleanup ──────────────────────────
         await self._cleanup_window()
 
-        # ── Wait for resolution ────────────────────────────
-        now = int(time.time())
-        remaining = self.window.window_end - now
-        if remaining > 0:
-            await asyncio.sleep(remaining + RESOLUTION_WAIT)
-        else:
-            await asyncio.sleep(RESOLUTION_WAIT)
-
-        # Capture BTC close price (current price ~6s after window end)
-        self.window.btc_close_price = self.price_feed.current_price
-
-        # ── Check outcomes for all trades this window ──────
-        await self._resolve_window()
-
-        # ── Redeem winning tokens on-chain → USDC.e back to proxy wallet ──
-        # await self._redeem_wins()  # disabled: another bot handles redeem
-
-        # ── Re-sync bankroll: catches fills missed by model ─
-        await self._refresh_bankroll()
-
-        # ── Log summary ────────────────────────────────────
-        self._log_window_summary()
+        # ── Spawn background resolution — don't block next window entry ──
+        # MOMENTUM/FADE GTC orders survive cleanup and get extra lifetime
+        # equal to RESOLUTION_WAIT before background task cancels them.
+        asyncio.create_task(self._resolve_window_background(self.window))
 
     # ── Inner evaluation loop ──────────────────────────────
 
@@ -360,8 +343,10 @@ class TradingBot:
         """GTC maker order for MOMENTUM and FADE strategies.
         Posts a resting limit bid at maker_price; cancelled by cleanup sweep if unfilled.
         """
+        order_price = trade.get("max_price", trade["maker_price"])
         log.info(
-            f"{label} | {trade['side']} @ ${trade['price']:.2f} | "
+            f"{label} | {trade['side']} @ ${trade['price']:.2f} "
+            f"(bid ${order_price:.2f}) | "
             f"Edge: {trade['edge']*100:.1f}% | "
             f"Bet: ${trade['bet_amount']:.2f} | "
             f"Shares: {trade['shares']}"
@@ -373,7 +358,7 @@ class TradingBot:
                 resp = place_maker_order(
                     self.client,
                     trade["token_id"],
-                    price=trade["maker_price"],
+                    price=trade.get("max_price", trade["maker_price"]),
                     size=trade["shares"],
                 )
                 order_id = resp.get("orderID") or resp.get("id")
@@ -417,32 +402,70 @@ class TradingBot:
 
         if not self.dry_run:
             # ── Book depth check ─────────────────────────────────
+            _post_maker_bid = False   # flag: skip IOC and go straight to maker bid
             try:
                 asks = get_ask_depth(self.client, token_id)
                 if not asks:
-                    log.info("SCALP | No asks in book — skipping (illiquid)")
-                    self._scalp_cooldown_until = time.time() + 30
-                    return
-                best_ask = float(asks[0].price)
-                # Ask-wall anomaly: single ask at near-certainty price = post-resolution book
-                if len(asks) == 1 and best_ask >= 0.95:
                     log.info(
-                        f"SCALP | book_anomaly — single ask at ${best_ask:.2f}, "
-                        f"likely post-resolution book — skipping"
+                        f"SCALP | No asks in book — posting maker bid @ ${max_price:.2f}"
                     )
-                    self._scalp_cooldown_until = time.time() + 30
-                    return
-                # Pre-sign gate: don't waste a signed order if fill is impossible
-                if best_ask > max_price:
-                    log.info(
-                        f"SCALP | Best ask ${best_ask:.2f} exceeds max ${max_price:.2f} "
-                        f"— skipping (no fill possible)"
-                    )
-                    self._scalp_cooldown_until = time.time() + 30
-                    return
-                log.info(f"SCALP | Book has {len(asks)} ask level(s), best ${best_ask:.2f} — proceeding")
+                    _post_maker_bid = True
+                else:
+                    best_ask = float(asks[0].price)
+                    # Ask-wall anomaly: single ask at near-certainty price = post-resolution book
+                    if len(asks) == 1 and best_ask >= 0.95:
+                        log.info(
+                            f"SCALP | book_anomaly — single ask at ${best_ask:.2f}, "
+                            f"likely post-resolution book — skipping"
+                        )
+                        self._scalp_cooldown_until = time.time() + 30
+                        return
+                    if best_ask > max_price:
+                        log.info(
+                            f"SCALP | Best ask ${best_ask:.2f} exceeds max ${max_price:.2f} "
+                            f"— posting maker bid @ ${max_price:.2f}"
+                        )
+                        _post_maker_bid = True
+                    else:
+                        log.info(
+                            f"SCALP | Book has {len(asks)} ask level(s), "
+                            f"best ${best_ask:.2f} — proceeding with IOC"
+                        )
             except Exception as e:
                 log.warning(f"SCALP | Book depth check failed: {e} — proceeding anyway")
+
+            # ── Maker bid path (no fillable asks) ────────────────
+            if _post_maker_bid:
+                try:
+                    gtc_resp = place_maker_order(
+                        self.client, token_id,
+                        price=max_price,
+                        size=trade["shares"],
+                    )
+                    gtc_order_id = gtc_resp.get("orderID") or gtc_resp.get("id")
+                    log.info(
+                        f"SCALP | Maker bid posted @ ${max_price:.2f} | "
+                        f"{trade['shares']} shares | Order: {gtc_order_id}"
+                    )
+                    gtc_record = {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "window": self.window.window_start,
+                        "slug": self.window.slug,
+                        "order_id": gtc_order_id,
+                        "status": "pending",
+                        **trade,
+                        "price": max_price,
+                        "maker_price": max_price,
+                        "bet_amount": round(trade["shares"] * max_price, 2),
+                        "use_maker": True,
+                        "strategy": "scalp_gtc",
+                        "bankroll_before": self.bankroll,
+                    }
+                    self.window.trades.append(gtc_record)
+                    self.trade_log.append(gtc_record)
+                except Exception as e:
+                    log.error(f"SCALP | Maker bid failed: {e}")
+                return
 
             # ── Single IOC order ─────────────────────────────────
             ioc_filled = False
@@ -542,25 +565,113 @@ class TradingBot:
     # ── End-of-window cleanup ──────────────────────────────
 
     async def _cleanup_window(self):
-        """Cancel all resting GTC orders at window close, then mark unfilled trades."""
-        if not self.dry_run and self.client:
-            try:
-                cancel_all(self.client)
-            except Exception as e:
-                log.error(f"cancel_all safety sweep failed: {e}")
+        """Cancel resting GTC orders at window close.
 
-            # Mark any still-pending GTC orders as cancelled so resolution skips them
-            for trade in self.window.trades:
+        MOMENTUM and FADE GTC orders are intentionally left open — they get
+        extra fill time equal to RESOLUTION_WAIT before the background task
+        cancels them. All other orders (scalp_gtc, etc.) are cancelled now.
+        """
+        if not self.dry_run and self.client:
+            # Determine if any MOMENTUM/FADE orders need to survive
+            surviving = [
+                t for t in self.window.trades
+                if t.get("status") == "pending"
+                and t.get("order_id")
+                and t.get("strategy") in ("momentum", "fade")
+            ]
+
+            if surviving:
+                # Cancel non-MOMENTUM/FADE orders individually; leave survivors open
+                for trade in self.window.trades:
+                    if trade.get("status") != "pending" or not trade.get("order_id"):
+                        continue
+                    if trade.get("strategy") in ("momentum", "fade"):
+                        log.info(
+                            f"CLEANUP | {trade.get('strategy','?')} GTC left open "
+                            f"(+{RESOLUTION_WAIT}s extra lifetime) | "
+                            f"Order: {trade['order_id']}"
+                        )
+                        continue  # let it ride through resolution wait
+                    # Cancel all other resting orders
+                    try:
+                        cancel_order(self.client, trade["order_id"])
+                        trade["status"] = "cancelled"
+                        log.info(
+                            f"CLEANUP | Cancelled {trade.get('strategy','?')} "
+                            f"Order: {trade['order_id']}"
+                        )
+                    except Exception as e:
+                        log.warning(
+                            f"CLEANUP | Could not cancel {trade['order_id']}: {e}"
+                        )
+            else:
+                # No survivors — safe to cancel everything at once
+                try:
+                    cancel_all(self.client)
+                except Exception as e:
+                    log.error(f"cancel_all safety sweep failed: {e}")
+
+                # Mark non-MOMENTUM/FADE GTC orders as cancelled
+                for trade in self.window.trades:
+                    if trade.get("status") != "pending" or not trade.get("order_id"):
+                        continue
+                    if not trade.get("use_maker"):
+                        continue  # IOC orders self-cancel
+                    try:
+                        info = get_order_status(self.client, trade["order_id"])
+                        size_matched = float(
+                            info.get("size_matched") or info.get("filled") or 0
+                        )
+                        if size_matched == 0:
+                            trade["status"] = "cancelled"
+                            log.info(
+                                f"GTC unfilled — cancelled | "
+                                f"{trade.get('strategy','?')} {trade.get('side','?')} "
+                                f"Order: {trade['order_id']}"
+                            )
+                        else:
+                            trade["size_matched"] = size_matched
+                            log.info(
+                                f"GTC filled ${size_matched:.2f} | "
+                                f"{trade.get('strategy','?')} {trade.get('side','?')} "
+                                f"Order: {trade['order_id']}"
+                            )
+                    except Exception as e:
+                        log.warning(
+                            f"Could not fetch GTC order status {trade['order_id']}: {e}"
+                        )
+
+    async def _resolve_window_background(self, window: "WindowState"):
+        """
+        Background task: waits RESOLUTION_WAIT seconds, then cancels any
+        still-open MOMENTUM/FADE GTC orders, resolves P&L, and refreshes bankroll.
+
+        Runs concurrently with the next window's trading so the main loop
+        re-enters at T=0 instead of T-120.
+        """
+        now = int(time.time())
+        remaining = window.window_end - now
+        await asyncio.sleep(max(0, remaining) + RESOLUTION_WAIT)
+
+        window.btc_close_price = self.price_feed.current_price
+
+        # Check and cancel any MOMENTUM/FADE orders that survived cleanup
+        if not self.dry_run and self.client:
+            for trade in window.trades:
                 if trade.get("status") != "pending" or not trade.get("order_id"):
                     continue
-                if not trade.get("use_maker"):
-                    continue  # IOC orders self-cancel; don't need to check
+                if trade.get("strategy") not in ("momentum", "fade"):
+                    continue
                 try:
                     info = get_order_status(self.client, trade["order_id"])
                     size_matched = float(
                         info.get("size_matched") or info.get("filled") or 0
                     )
                     if size_matched == 0:
+                        try:
+                            cancel_order(self.client, trade["order_id"])
+                        except Exception:
+                            pass
                         trade["status"] = "cancelled"
                         log.info(
                             f"GTC unfilled — cancelled | "
@@ -568,7 +679,6 @@ class TradingBot:
                             f"Order: {trade['order_id']}"
                         )
                     else:
-                        # Partial or full fill — record actual fill size for resolution
                         trade["size_matched"] = size_matched
                         log.info(
                             f"GTC filled ${size_matched:.2f} | "
@@ -577,12 +687,17 @@ class TradingBot:
                         )
                 except Exception as e:
                     log.warning(
-                        f"Could not fetch GTC order status {trade['order_id']}: {e}"
+                        f"Could not check/cancel order {trade['order_id']}: {e}"
                     )
+
+        await self._resolve_window(window)
+        # await self._redeem_wins()  # disabled: another bot handles redeem
+        await self._refresh_bankroll()
+        self._log_window_summary(window)
 
     # ── Resolution ─────────────────────────────────────────
 
-    async def _resolve_window(self):
+    async def _resolve_window(self, window: "WindowState | None" = None):
         """
         Determine win/loss for each trade using the actual BTC price change.
         Compares btc_open_price (captured at window start) against
@@ -590,15 +705,16 @@ class TradingBot:
         This avoids Polymarket token settlement lag which caused
         "Resolution unclear" false-negatives.
         """
-        if not self.window or not self.window.trades:
+        w = window if window is not None else self.window
+        if not w or not w.trades:
             return
 
-        btc_open = self.window.btc_open_price
-        btc_close = self.window.btc_close_price
+        btc_open = w.btc_open_price
+        btc_close = w.btc_close_price
 
         if not btc_open or not btc_close:
             log.warning(
-                f"Window {self.window.window_start} | "
+                f"Window {w.window_start} | "
                 f"BTC prices unavailable for resolution. Skipping P&L."
             )
             return
@@ -609,18 +725,18 @@ class TradingBot:
             winning_side = "Down"
         else:
             log.warning(
-                f"Window {self.window.window_start} | "
+                f"Window {w.window_start} | "
                 f"BTC open == close (${btc_open:,.2f}). No clear winner."
             )
             return
 
         log.info(
-            f"Window {self.window.window_start} | "
+            f"Window {w.window_start} | "
             f"BTC: ${btc_open:,.2f} → ${btc_close:,.2f} | "
             f"Winner: {winning_side}"
         )
 
-        for trade in self.window.trades:
+        for trade in w.trades:
             # Skip cancelled orders — no P&L
             if trade.get("status") == "cancelled":
                 continue
@@ -836,13 +952,14 @@ class TradingBot:
         )
         return drawdown >= DAILY_LOSS_LIMIT_PCT
 
-    def _log_window_summary(self):
+    def _log_window_summary(self, window: "WindowState | None" = None):
         """Print a summary line after each window resolves."""
-        if not self.window:
+        w = window if window is not None else self.window
+        if not w:
             return
 
         active_trades = [
-            t for t in self.window.trades
+            t for t in w.trades
             if t.get("status") == "resolved"
         ]
         if not active_trades:
@@ -852,7 +969,7 @@ class TradingBot:
         strategies_used = set(t.get("strategy", "?") for t in active_trades)
 
         log.info(
-            f"WINDOW SUMMARY | {self.window.window_start} | "
+            f"WINDOW SUMMARY | {w.window_start} | "
             f"Trades: {len(active_trades)} | "
             f"Strategies: {','.join(strategies_used)} | "
             f"P&L: ${window_pnl:+.2f} | "
