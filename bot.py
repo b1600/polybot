@@ -36,6 +36,7 @@ from executor import (
     cancel_order,
     get_usdc_balance,
     get_ask_depth,
+    get_book,
     get_order_status,
     redeem_positions,
     fetch_redeemable_positions,
@@ -177,6 +178,11 @@ class TradingBot:
         self.losses = 0
         self._scalp_cooldown_until: float = 0.0
 
+        # Rec 4C: rolling calibration state (last 20 resolved trades)
+        self._wr_history: list[int] = []       # 1=win, 0=loss
+        self._p_win_history: list[float] = []  # model P(win) at trade time
+        self._kelly_throttle: float = 1.0      # halved when model is miscalibrated
+
     # ── Main loop ──────────────────────────────────────────
 
     async def run(self):
@@ -292,6 +298,11 @@ class TradingBot:
             if seconds_remaining < 3:
                 break  # window is over
 
+            # Rec 3: T-180 entry cutoff — no new signals after 180s into window
+            if seconds_remaining < 120:
+                await asyncio.sleep(max(1, seconds_remaining - 3))
+                break
+
             # Don't over-trade
             if self.window.trade_count >= MAX_TRADES_PER_WINDOW:
                 await asyncio.sleep(seconds_remaining)
@@ -337,12 +348,31 @@ class TradingBot:
             sleep_time = min(EVAL_INTERVAL, max(1, seconds_remaining - 3))
             await asyncio.sleep(sleep_time)
 
+    # ── Kelly throttle (Rec 4C) ────────────────────────────
+
+    def _apply_kelly_throttle(self, trade: dict) -> bool:
+        """Scale bet by _kelly_throttle. Returns False if result falls below $2.50 minimum."""
+        if self._kelly_throttle >= 1.0:
+            return True
+        trade["bet_amount"] = round(trade["bet_amount"] * self._kelly_throttle, 2)
+        trade["shares"] = round(trade["bet_amount"] / trade["price"], 1)
+        trade["bet_amount"] = round(trade["shares"] * trade["price"], 2)
+        if trade["bet_amount"] < 2.50:
+            log.info(
+                f"Kelly throttle | Scaled bet ${trade['bet_amount']:.2f} < $2.50 minimum — skipping"
+            )
+            return False
+        return True
+
     # ── Execution: Directional (Momentum / Fade) ──────────────────────
 
     async def _execute_directional(self, trade: dict, label: str):
         """GTC maker order for MOMENTUM and FADE strategies.
         Posts a resting limit bid at maker_price; cancelled by cleanup sweep if unfilled.
         """
+        if not self._apply_kelly_throttle(trade):
+            return
+
         order_price = trade.get("max_price", trade["maker_price"])
         log.info(
             f"{label} | {trade['side']} @ ${trade['price']:.2f} "
@@ -379,6 +409,12 @@ class TradingBot:
         self.window.trades.append(trade_record)
         self.trade_log.append(trade_record)
 
+        # Rec 5: spawn adverse-fill monitor for GTC orders
+        if order_id and not self.dry_run:
+            asyncio.create_task(
+                self._monitor_gtc(order_id, order_price, trade["side"], trade["token_id"], trade_record)
+            )
+
     # ── Execution: Scalp (single-shot IOC taker) ──────────────────────
 
     async def _execute_scalp(self, trade: dict):
@@ -388,6 +424,9 @@ class TradingBot:
         2. Place one IOC order, capped at max_price to keep positive EV.
         No GTC, no polling, no retry chain.
         """
+        if not self._apply_kelly_throttle(trade):
+            return
+
         token_id = trade["token_id"]
         bet_amount = trade["bet_amount"]
         max_price = trade.get("max_price", 0)
@@ -561,6 +600,74 @@ class TradingBot:
         }
         self.window.trades.append(trade_record)
         self.trade_log.append(trade_record)
+
+    # ── Rec 5: GTC adverse-fill monitor ───────────────────
+
+    async def _monitor_gtc(
+        self,
+        order_id: str,
+        posted_price: float,
+        direction: str,
+        token_id: str,
+        trade_record: dict,
+    ):
+        """
+        Poll the book every 15s after posting a GTC bid.
+        Cancel if adverse conditions appear:
+          1. best_ask < posted_price - 0.02 — signal reversed
+          2. best_bid > posted_price       — stronger buyer appeared (adverse selection)
+          3. single ask ≥ $0.95            — post-resolution book anomaly
+        """
+        await asyncio.sleep(15)  # initial wait before first check
+        while True:
+            if trade_record.get("status") != "pending":
+                return  # already filled or cancelled by cleanup
+
+            # Confirm order is still open
+            try:
+                info = get_order_status(self.client, order_id)
+                size_matched = float(info.get("size_matched") or info.get("filled") or 0)
+                if size_matched > 0 or info.get("status") in ("MATCHED", "FILLED"):
+                    return  # filled — nothing to cancel
+            except Exception as e:
+                log.warning(f"GTC monitor | Status check failed for {order_id}: {e}")
+                await asyncio.sleep(15)
+                continue
+
+            # Check book for adverse conditions
+            try:
+                book = get_book(self.client, token_id)
+                cancel_reason = None
+
+                if book and book.asks:
+                    best_ask = float(book.asks[0].price)
+                    if best_ask < posted_price - 0.02:
+                        cancel_reason = (
+                            f"ask ${best_ask:.2f} < bid ${posted_price:.2f} − 2¢ (signal reversed)"
+                        )
+                    elif len(book.asks) == 1 and best_ask >= 0.95:
+                        cancel_reason = f"single ask ${best_ask:.2f} ≥ $0.95 (post-resolution book)"
+
+                if cancel_reason is None and book and book.bids:
+                    best_bid = float(book.bids[0].price)
+                    if best_bid > posted_price:
+                        cancel_reason = (
+                            f"best_bid ${best_bid:.2f} > our bid ${posted_price:.2f} (adverse selection)"
+                        )
+
+                if cancel_reason:
+                    try:
+                        cancel_order(self.client, order_id)
+                        trade_record["status"] = "cancelled"
+                        log.info(f"GTC monitor | Cancelled {order_id} — {cancel_reason}")
+                    except Exception as e:
+                        log.warning(f"GTC monitor | Cancel failed for {order_id}: {e}")
+                    return
+
+            except Exception as e:
+                log.warning(f"GTC monitor | Book fetch failed for {token_id}: {e}")
+
+            await asyncio.sleep(15)
 
     # ── End-of-window cleanup ──────────────────────────────
 
@@ -785,6 +892,33 @@ class TradingBot:
             trade["status"] = "resolved"
             trade["bankroll_after"] = round(self.bankroll, 2)
             self.total_trades += 1
+
+            # Rec 4C: update rolling calibration state
+            self._wr_history.append(1 if side == winning_side else 0)
+            self._p_win_history.append(trade.get("estimated_prob", 0.75))
+            if len(self._wr_history) > 20:
+                self._wr_history.pop(0)
+                self._p_win_history.pop(0)
+
+        # Rec 4C: recompute kelly throttle after resolving this window
+        if len(self._wr_history) >= 10:
+            rolling_wr = sum(self._wr_history) / len(self._wr_history)
+            implied_wr = sum(self._p_win_history) / len(self._p_win_history)
+            if rolling_wr < implied_wr - 0.10:
+                if self._kelly_throttle > 0.5:
+                    self._kelly_throttle = 0.5
+                    log.warning(
+                        f"Kelly throttle | Activated — realized WR {rolling_wr:.1%} "
+                        f"vs model {implied_wr:.1%} (gap {implied_wr - rolling_wr:.1%}) "
+                        f"— halving bet sizes"
+                    )
+            else:
+                if self._kelly_throttle < 1.0:
+                    self._kelly_throttle = 1.0
+                    log.info(
+                        f"Kelly throttle | Restored — realized WR {rolling_wr:.1%} "
+                        f"vs model {implied_wr:.1%} gap within tolerance"
+                    )
 
     # ── Redemption sweep ───────────────────────────────────
 

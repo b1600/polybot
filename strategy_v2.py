@@ -31,6 +31,8 @@ import logging
 
 log = logging.getLogger("strategy_v2")
 
+MAX_BUY_PRICE = 0.80  # Rec 2: skip entries above this price — adverse payoff math
+
 
 # ═══════════════════════════════════════════════════════════
 # STRATEGY A: Early Momentum (replaces Market Making)
@@ -51,7 +53,7 @@ class EarlyMomentumStrategy:
     def __init__(
         self,
         min_delta_pct: float = 0.30,      # need ≥0.30% BTC move
-        kelly_fraction: float = 0.25,      # quarter-Kelly
+        kelly_fraction: float = 0.125,     # eighth-Kelly (Rec 4B: halved from quarter)
         min_edge: float = 0.05,            # need 5% net edge after fees
         min_bet: float = 2.50,             # GTC min: 5 shares × $0.50 = $2.50
         min_shares: int = 5,               # Polymarket CLOB GTC minimum
@@ -90,6 +92,9 @@ class EarlyMomentumStrategy:
             side = "Down"
             prob_win = 1.0 - prob_up
             market_price = market["Down"]["price"]
+
+        if market_price > MAX_BUY_PRICE:
+            return None  # Rec 2: adverse payoff math above $0.80
 
         edge = prob_win - market_price
         taker_fee = 4 * market_price * (1 - market_price) * 0.0156
@@ -258,8 +263,8 @@ class LateScalpStrategy:
 
     def __init__(
         self,
-        min_delta_pct: float = 0.15,     # minimum 0.15% BTC move
-        kelly_fraction: float = 0.25,     # quarter-Kelly (conservative)
+        min_delta_pct: float = 0.20,     # Rec 1: raised from 0.15% — weak signals below this lack edge
+        kelly_fraction: float = 0.125,   # Rec 4B: eighth-Kelly (halved from quarter)
         min_edge: float = 0.05,           # need 5% edge minimum
         high_edge_threshold: float = 0.10, # edge above this → 2% max_price buffer
         min_bet: float = 2.50,            # IOC: match GTC floor for consistency
@@ -304,6 +309,9 @@ class LateScalpStrategy:
             side = "Down"
             prob_win = 1.0 - prob_up
             market_price = market["Down"]["price"]
+
+        if market_price > MAX_BUY_PRICE:
+            return None  # Rec 2: adverse payoff math above $0.80
 
         edge = prob_win - market_price
         taker_fee = 4 * market_price * (1 - market_price) * 0.0156

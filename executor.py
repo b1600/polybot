@@ -285,3 +285,12 @@ def cancel_all(client):
 def get_order_status(client, order_id) -> dict:
     """Fetch current order info (status, size_matched, original_size, etc.)."""
     return client.get_order(order_id)
+
+
+def get_book(client, token_id):
+    """Return the full order book (bids + asks) for a token, or None on error."""
+    try:
+        return client.get_order_book(token_id)
+    except Exception as e:
+        log.warning(f"Order book fetch failed: {e}")
+        return None
