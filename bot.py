@@ -441,70 +441,32 @@ class TradingBot:
 
         if not self.dry_run:
             # ── Book depth check ─────────────────────────────────
-            _post_maker_bid = False   # flag: skip IOC and go straight to maker bid
             try:
                 asks = get_ask_depth(self.client, token_id)
                 if not asks:
+                    log.info("SCALP | No asks in book — skipping")
+                    return
+                best_ask = float(asks[0].price)
+                # Best ask at near-certainty price = post-resolution book
+                if best_ask >= 0.95:
                     log.info(
-                        f"SCALP | No asks in book — posting maker bid @ ${max_price:.2f}"
+                        f"SCALP | book_anomaly — best ask ${best_ask:.2f} ≥ $0.95, "
+                        f"likely post-resolution book — skipping"
                     )
-                    _post_maker_bid = True
-                else:
-                    best_ask = float(asks[0].price)
-                    # Ask-wall anomaly: single ask at near-certainty price = post-resolution book
-                    if len(asks) == 1 and best_ask >= 0.95:
-                        log.info(
-                            f"SCALP | book_anomaly — single ask at ${best_ask:.2f}, "
-                            f"likely post-resolution book — skipping"
-                        )
-                        self._scalp_cooldown_until = time.time() + 30
-                        return
-                    if best_ask > max_price:
-                        log.info(
-                            f"SCALP | Best ask ${best_ask:.2f} exceeds max ${max_price:.2f} "
-                            f"— posting maker bid @ ${max_price:.2f}"
-                        )
-                        _post_maker_bid = True
-                    else:
-                        log.info(
-                            f"SCALP | Book has {len(asks)} ask level(s), "
-                            f"best ${best_ask:.2f} — proceeding with IOC"
-                        )
+                    self._scalp_cooldown_until = time.time() + 30
+                    return
+                if best_ask > max_price:
+                    log.info(
+                        f"SCALP | Best ask ${best_ask:.2f} exceeds max ${max_price:.2f} — skipping"
+                    )
+                    self._scalp_cooldown_until = time.time() + 30
+                    return
+                log.info(
+                    f"SCALP | Book has {len(asks)} ask level(s), "
+                    f"best ${best_ask:.2f} — proceeding with IOC"
+                )
             except Exception as e:
                 log.warning(f"SCALP | Book depth check failed: {e} — proceeding anyway")
-
-            # ── Maker bid path (no fillable asks) ────────────────
-            if _post_maker_bid:
-                try:
-                    gtc_resp = place_maker_order(
-                        self.client, token_id,
-                        price=max_price,
-                        size=trade["shares"],
-                    )
-                    gtc_order_id = gtc_resp.get("orderID") or gtc_resp.get("id")
-                    log.info(
-                        f"SCALP | Maker bid posted @ ${max_price:.2f} | "
-                        f"{trade['shares']} shares | Order: {gtc_order_id}"
-                    )
-                    gtc_record = {
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "window": self.window.window_start,
-                        "slug": self.window.slug,
-                        "order_id": gtc_order_id,
-                        "status": "pending",
-                        **trade,
-                        "price": max_price,
-                        "maker_price": max_price,
-                        "bet_amount": round(trade["shares"] * max_price, 2),
-                        "use_maker": True,
-                        "strategy": "scalp_gtc",
-                        "bankroll_before": self.bankroll,
-                    }
-                    self.window.trades.append(gtc_record)
-                    self.trade_log.append(gtc_record)
-                except Exception as e:
-                    log.error(f"SCALP | Maker bid failed: {e}")
-                return
 
             # ── Single IOC order ─────────────────────────────────
             ioc_filled = False
@@ -537,56 +499,11 @@ class TradingBot:
                     )
                 else:
                     log.info(
-                        f"SCALP | IOC no fill at max ${max_price:.2f} — attempting GTC fallback"
+                        f"SCALP | IOC no fill at max ${max_price:.2f} — skipping"
                     )
                     order_id = None
             except Exception as e:
-                log.error(f"SCALP | IOC placement failed: {e} — attempting GTC fallback")
-
-            # ── GTC fallback if IOC didn't fill ──────────────────
-            # Triggers whether the IOC returned no-fill OR threw an exception.
-            # Posts a resting limit at the current best ask — becomes the
-            # liquidity rather than chasing it.
-            if not ioc_filled:
-                try:
-                    current_asks = get_ask_depth(self.client, token_id)
-                    if current_asks:
-                        best_ask = float(current_asks[0].price)
-                        if best_ask > max_price:
-                            log.info(
-                                f"SCALP | GTC fallback skipped — best ask ${best_ask:.2f} exceeds max ${max_price:.2f}"
-                            )
-                            return
-                        gtc_shares = trade["shares"]
-                        gtc_resp = place_maker_order(
-                            self.client, token_id, price=best_ask, size=gtc_shares
-                        )
-                        gtc_order_id = gtc_resp.get("orderID") or gtc_resp.get("id")
-                        log.info(
-                            f"SCALP | GTC fallback resting @ ${best_ask:.2f} | "
-                            f"{gtc_shares} shares | Order: {gtc_order_id}"
-                        )
-                        gtc_record = {
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "window": self.window.window_start,
-                            "slug": self.window.slug,
-                            "order_id": gtc_order_id,
-                            "status": "pending",
-                            **trade,
-                            "price": best_ask,
-                            "maker_price": best_ask,
-                            "bet_amount": round(gtc_shares * best_ask, 2),
-                            "use_maker": True,
-                            "strategy": "scalp_gtc",
-                            "bankroll_before": self.bankroll,
-                        }
-                        self.window.trades.append(gtc_record)
-                        self.trade_log.append(gtc_record)
-                        return  # GTC placed — IOC miss not worth recording
-                    else:
-                        log.info("SCALP | GTC fallback skipped — no asks in book")
-                except Exception as e:
-                    log.error(f"SCALP | GTC fallback failed: {e}")
+                log.error(f"SCALP | IOC placement failed: {e}")
 
         trade_record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
