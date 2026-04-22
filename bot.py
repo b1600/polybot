@@ -341,7 +341,6 @@ class TradingBot:
                 if time.time() < self._scalp_cooldown_until:
                     pass  # cooldown active — skip this tick
                 else:
-                    self.window.scalp_fired = True
                     await self._execute_scalp(result)
 
             # Sleep until next tick
@@ -467,6 +466,9 @@ class TradingBot:
                 )
             except Exception as e:
                 log.warning(f"SCALP | Book depth check failed: {e} — proceeding anyway")
+
+            # Book check passed — lock the scalp slot for this window
+            self.window.scalp_fired = True
 
             # ── Single IOC order ─────────────────────────────────
             ioc_filled = False
@@ -987,7 +989,7 @@ class TradingBot:
         """Fetch market data with error handling."""
         try:
             market = fetch_market(self.window.slug)
-            if market and market.get("accepting_orders", True):
+            if market and market.get("accepting_orders", False):
                 return market
         except Exception as e:
             log.error(f"Market fetch failed: {e}")
