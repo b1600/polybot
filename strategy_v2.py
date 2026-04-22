@@ -11,9 +11,9 @@
 #    Buy the cheap side when market price is extreme (>0.85) AND
 #    the move looks like a spike (5s vol >> 60s vol). Taker order.
 #
-# C) Mid-Window Scalp (T-220 to T-10):
+# C) Mid-Window Scalp (T-240 to T-10):
 #    Single-shot IOC taker bet after checking order book depth.
-#    Enters at T-220 before counter-parties reprice away from the current ask.
+#    Enters at T-240 before counter-parties reprice away from the current ask.
 #    Caps the fill price at prob_win - min_edge to preserve positive EV.
 #    Skips if the book has no asks (illiquid market).
 #
@@ -397,7 +397,7 @@ class CombinedStrategy:
         Called multiple times per window. Returns:
         - ("momentum", trade)  — early directional bet (T-120 to T-90)
         - ("fade", trade)      — fade a spike (T-180 to T-90)
-        - ("scalp", trade)     — directional bet (T-90 to T-10)
+        - ("scalp", trade)     — directional bet (T-240 to T-10)
         - ("skip", None)       — do nothing this phase
         """
         # Phase 1: Early momentum (T-120 to T-90)
@@ -417,8 +417,8 @@ class CombinedStrategy:
             if trade:
                 return ("fade", trade)
 
-        # Phase 3: Mid-window scalp (T-220 to T-10) — enter before market reprices
-        if seconds_remaining <= 220 and not self._scalp_fired:
+        # Phase 3: Mid-window scalp (T-240 to T-10) — enter before market reprices
+        if seconds_remaining <= 240 and not self._scalp_fired:
             trade = self.scalp.evaluate(
                 market, bankroll, price_feed, seconds_remaining
             )

@@ -3,7 +3,7 @@
 # Three strategies fire at different phases:
 #   T-120 → T-90:  Early momentum (directional, taker FAK)
 #   T-180 → T-90:  Fade extreme spikes (opportunistic, taker FAK)
-#   T-220 → T-10:  Late-window scalp — single-shot taker execution:
+#   T-240 → T-10:  Late-window scalp — single-shot taker execution:
 #                    1. Check order book depth — skip if no asks (illiquid)
 #                    2. Place one IOC order, capped at max_price
 #                       (prob_win - min_edge) to keep positive EV
