@@ -343,12 +343,14 @@ class LateScalpStrategy:
         price_buffer = 0.04 if edge >= self.high_edge_threshold else 0.03
         max_price = round(min(prob_win - self.min_edge + price_buffer, 0.95), 2)
 
+        eval_token_id = market[side]["token_id"]
         log.info(
             f"SCALP | {side} @ ${market_price:.2f} (max ${max_price:.2f}) | "
             f"Delta: {delta*100:+.3f}% | Vol: {vol*100:.4f}% | "
             f"P(win): {prob_win:.2f} | Edge: {net_edge:.3f} | "
             f"Buffer: +{int(price_buffer*100)}% | "
-            f"Shares: {shares} | Bet: ${bet_amount:.2f}"
+            f"Shares: {shares} | Bet: ${bet_amount:.2f} | "
+            f"token={eval_token_id}"
         )
 
         return {

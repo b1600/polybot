@@ -441,7 +441,18 @@ class TradingBot:
         if not self.dry_run:
             # ── Book depth check ─────────────────────────────────
             try:
-                asks = get_ask_depth(self.client, token_id)
+                book = get_book(self.client, token_id)
+                asks = book.asks if book else []
+                bids = book.bids if book else []
+
+                # Log full snapshot so we can distinguish real vs stale/wrong-token books
+                asks_snapshot = [(float(a.price), float(a.size)) for a in asks[:5]]
+                bids_snapshot = [(float(b.price), float(b.size)) for b in bids[:5]]
+                log.info(
+                    f"SCALP | book_snapshot token={token_id} | "
+                    f"asks={asks_snapshot} | bids={bids_snapshot}"
+                )
+
                 if not asks:
                     log.info("SCALP | No asks in book — skipping")
                     return
