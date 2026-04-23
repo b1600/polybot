@@ -294,3 +294,23 @@ def get_book(client, token_id):
     except Exception as e:
         log.warning(f"Order book fetch failed: {e}")
         return None
+
+
+def get_clob_mid(client, token_id) -> float | None:
+    """
+    Return the CLOB mid-price (best_bid + best_ask) / 2 for a token.
+    Returns None if the book has no bids, no asks, or asks are >= 0.95
+    (post-resolution sentinel).
+    """
+    try:
+        book = client.get_order_book(token_id)
+        if not book or not book.bids or not book.asks:
+            return None
+        best_bid = float(book.bids[0].price)
+        best_ask = float(book.asks[0].price)
+        if best_ask >= 0.95:
+            return None
+        return (best_bid + best_ask) / 2
+    except Exception as e:
+        log.warning(f"CLOB mid fetch failed for {token_id}: {e}")
+        return None
