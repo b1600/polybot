@@ -37,7 +37,6 @@ from executor import (
     get_usdc_balance,
     get_ask_depth,
     get_book,
-    get_clob_mid,
     get_order_status,
     redeem_positions,
     fetch_redeemable_positions,
@@ -986,75 +985,15 @@ class TradingBot:
 
     # ── Helpers ────────────────────────────────────────────
 
-    # Reject markets within this many seconds of their close (fix #1)
-    _END_TIME_GUARD_SECS = 90
-
     def _fetch_market_safe(self) -> dict | None:
-        """
-        Fetch market data with two liveness checks:
-
-        Fix #1 — End-time guard: skip if we're within 90s of window close.
-          Gamma's accepting_orders flag can lag reality; markets near expiry
-          are too risky regardless.
-
-        Fix #2 — CLOB mid-price: replace Gamma's cached outcomePrices with
-          live bid/ask mids from the CLOB. Rejects books with no bids, no asks,
-          or asks already at the post-resolution sentinel (>= $0.95).
-          Also rejects if the two token mids don't sum to ~$1.00 (stale/broken).
-        """
-        # Fix #1: end-time guard
-        seconds_remaining = self.window.window_end - time.time()
-        if seconds_remaining < self._END_TIME_GUARD_SECS:
-            log.info(
-                f"Market fetch skipped — only {seconds_remaining:.0f}s to window close "
-                f"(guard: {self._END_TIME_GUARD_SECS}s)"
-            )
-            return None
-
+        """Fetch market data with error handling."""
         try:
             market = fetch_market(self.window.slug)
-            if not market or not market.get("accepting_orders", False):
-                return None
+            if market and market.get("accepting_orders", False):
+                return market
         except Exception as e:
             log.error(f"Market fetch failed: {e}")
-            return None
-
-        # Fix #2: CLOB mid-price validation (skipped in dry run — no live client)
-        if not self.dry_run:
-            up_token = market.get("Up", {}).get("token_id")
-            down_token = market.get("Down", {}).get("token_id")
-
-            if not up_token or not down_token:
-                log.warning("Market missing token IDs — skipping")
-                return None
-
-            up_mid = get_clob_mid(self.client, up_token)
-            down_mid = get_clob_mid(self.client, down_token)
-
-            if up_mid is None or down_mid is None:
-                log.info(
-                    f"Market rejected — dead CLOB book "
-                    f"(up_mid={up_mid}, down_mid={down_mid})"
-                )
-                return None
-
-            mid_sum = up_mid + down_mid
-            if not (0.90 <= mid_sum <= 1.10):
-                log.info(
-                    f"Market rejected — mid prices don't sum to ~$1.00 "
-                    f"(up={up_mid:.3f} + down={down_mid:.3f} = {mid_sum:.3f})"
-                )
-                return None
-
-            # Replace Gamma's stale cached prices with live CLOB mids
-            market["Up"]["price"] = round(up_mid, 4)
-            market["Down"]["price"] = round(down_mid, 4)
-            log.info(
-                f"CLOB mid-prices — Up: ${up_mid:.3f} | Down: ${down_mid:.3f} "
-                f"(sum: ${mid_sum:.3f})"
-            )
-
-        return market
+        return None
 
     def _is_daily_loss_limit_hit(self) -> bool:
         """Check if we've lost more than the daily limit."""
