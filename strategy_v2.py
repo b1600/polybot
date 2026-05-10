@@ -26,7 +26,6 @@
 # live because the CLOB immediately matches aggressive bids.
 # ─────────────────────────────────────────────────────────
 
-import math
 import logging
 
 log = logging.getLogger("strategy_v2")
@@ -435,38 +434,69 @@ class CombinedStrategy:
 # Shared utility: probability from delta
 # ═══════════════════════════════════════════════════════════
 
-def _estimate_prob_from_delta(delta_pct, seconds_remaining, volatility):
+# Empirical P(Up wins) by (seconds_remaining, delta%).
+# Built from 30 days of Binance 1m BTC/USDT klines via calibrate_model.py --days 30 --table.
+# Four distinct time rows (60s elapsed, 120s, 180s, 240s into the window).
+# Refresh by re-running: venv/bin/python3 calibrate_model.py --days 60 --table
+_EMPIRICAL_TABLE: dict[int, dict[float, float]] = {
+    240: {-0.20: 0.0333, -0.15: 0.1566, -0.10: 0.2581, -0.05: 0.2983,
+           0.00: 0.5003,  0.05: 0.7199,  0.10: 0.8106,  0.15: 0.8750,  0.20: 0.8857},
+    180: {-0.25: 0.0333, -0.20: 0.0816, -0.15: 0.0778, -0.10: 0.1725, -0.05: 0.2603,
+           0.00: 0.4970,  0.05: 0.7444,  0.10: 0.8610,  0.15: 0.8889,  0.20: 0.9375,  0.25: 1.0000},
+    120: {-0.25: 0.0000, -0.20: 0.0306, -0.15: 0.0714, -0.10: 0.0823, -0.05: 0.2180,
+           0.00: 0.4947,  0.05: 0.8045,  0.10: 0.9029,  0.15: 0.9395,  0.20: 0.9667,
+           0.25: 0.9722,  0.30: 1.0000},
+    60:  {-0.35: 0.0000, -0.30: 0.0000, -0.25: 0.0000, -0.20: 0.0000, -0.15: 0.0154,
+          -0.10: 0.0534, -0.05: 0.1507,  0.00: 0.4936,  0.05: 0.8515,  0.10: 0.9614,
+           0.15: 0.9803,  0.20: 0.9924,  0.25: 1.0000,  0.30: 1.0000},
+}
+_EMPIRICAL_SECS = sorted(_EMPIRICAL_TABLE.keys(), reverse=True)  # [240, 180, 120, 60]
+
+
+def _interp_delta(row: dict[float, float], delta_pct: float) -> float:
+    """Linear interpolation across delta buckets in one time row."""
+    deltas = sorted(row.keys())
+    if delta_pct <= deltas[0]:
+        return row[deltas[0]]
+    if delta_pct >= deltas[-1]:
+        return row[deltas[-1]]
+    for i in range(len(deltas) - 1):
+        lo, hi = deltas[i], deltas[i + 1]
+        if lo <= delta_pct <= hi:
+            t = (delta_pct - lo) / (hi - lo)
+            return row[lo] * (1.0 - t) + row[hi] * t
+    return 0.50
+
+
+def _estimate_prob_from_delta(delta, seconds_remaining, volatility):
     """
-    Estimate P(Up wins) from current delta, time left, and volatility.
+    Estimate P(Up wins) via bilinear interpolation on the empirical table.
 
-    Normalises delta by remaining expected volatility (vol * sqrt(T))
-    to get a z-score, then converts via normal CDF.
-    Clamped to [0.10, 0.80] — we're never that certain.
+    `delta` is a fraction (e.g. 0.001 for a 0.1% BTC move).
+    `volatility` is accepted for API compatibility but not used — the empirical
+    table already encodes regime-average volatility scaling.
+    Clamped to [0.05, 0.95].
     """
-    if volatility <= 0:
-        volatility = 0.0001  # fallback: ~0.01% per second
+    delta_pct = delta * 100.0
 
-    remaining_vol = volatility * math.sqrt(max(seconds_remaining, 1))
+    secs = _EMPIRICAL_SECS  # [240, 180, 120, 60]
 
-    if remaining_vol <= 0:
-        return 0.50
+    if seconds_remaining >= secs[0]:
+        # Earlier than our earliest row — very weak signal, use 240s row
+        return max(0.05, min(0.95, _interp_delta(_EMPIRICAL_TABLE[secs[0]], delta_pct)))
 
-    z = delta_pct / remaining_vol
-    prob_up = _normal_cdf(z)
-    return max(0.10, min(0.80, prob_up))
+    if seconds_remaining <= secs[-1]:
+        # Later than our latest row — signal is even stronger, use 60s row
+        return max(0.05, min(0.95, _interp_delta(_EMPIRICAL_TABLE[secs[-1]], delta_pct)))
 
+    # Interpolate between the two bracketing time rows
+    for i in range(len(secs) - 1):
+        upper, lower = secs[i], secs[i + 1]
+        if lower <= seconds_remaining <= upper:
+            t = (seconds_remaining - lower) / (upper - lower)  # 1 = upper, 0 = lower
+            p_upper = _interp_delta(_EMPIRICAL_TABLE[upper], delta_pct)
+            p_lower = _interp_delta(_EMPIRICAL_TABLE[lower], delta_pct)
+            prob_up = t * p_upper + (1.0 - t) * p_lower
+            return max(0.05, min(0.95, prob_up))
 
-def _normal_cdf(x):
-    """Abramowitz & Stegun approximation of Φ(x), max error ~1.5e-7."""
-    sign = 1 if x >= 0 else -1
-    x = abs(x)
-    t = 1.0 / (1.0 + 0.2316419 * x)
-    d = 0.3989422804014327  # 1/sqrt(2π)
-    p = d * math.exp(-x * x / 2.0) * (
-        t * (0.319381530 +
-        t * (-0.356563782 +
-        t * (1.781477937 +
-        t * (-1.821255978 +
-        t * 1.330274429))))
-    )
-    return 0.5 + sign * (0.5 - p)
+    return 0.50  # unreachable

@@ -1,0 +1,33 @@
+how to Reload the full CSV                                                                                                                                                
+                                                                                                                                                                          
+⏺ Run these two commands in your venv terminal, in order:                                                                                                                   
+                                                                                                                                                                            
+  Step 1 — Reset the table and checkpoint:                                                                                                                                  
+  python3 -c "                                                                                                                                                              
+  import duckdb                                                                                                                                                             
+  con = duckdb.connect('./db/polybot.duckdb')                                                                                                                               
+  con.execute('DELETE FROM trades')                                                                                                                                         
+  con.execute(\"DELETE FROM _checkpoint WHERE csv_path = './processed/trades.csv'\")                                                                                        
+  # Also clear calibration tables so they rebuild fresh                             
+  for t in ['market_outcomes', 'window_trades', 'calibration', '_calibration_progress']:                                                                                    
+      con.execute(f'DROP TABLE IF EXISTS {t}')                                                                                                                              
+  print('Reset done')                                                                                                                                                       
+  con.close()                                                                                                                                                               
+  "                                                                                                                                                                         
+                                                                                                                                                                            
+  Step 2 — Reload the full CSV:                                                                                                                                           
+  python3 loadtoDB.py
+                     
+  This will run for a long time (the CSV has 1.2B rows). The live timer will show progress. It's resumable — if it gets interrupted, just run python3 loadtoDB.py again and 
+  it picks up from the last 50,000-row checkpoint.                                                                                                                          
+                                                                                                                                                                            
+  Step 3 — Once fully loaded, re-run calibration:                                                                                                                           
+  python3 01_calibrate.py                                                                                                                                                 
+
+  ---                                                                                                                                                                       
+  Tip: To verify row count is growing during the load:
+  python3 -c "                                                                                                                                                              
+  import duckdb                                                                                                                                                           
+  con = duckdb.connect('./db/polybot.duckdb')                                                                                                                               
+  print(con.execute('SELECT COUNT(*) FROM trades').fetchone()[0])                                                                                                         
+  con.close()

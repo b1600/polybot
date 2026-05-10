@@ -13,3 +13,5 @@ build/
 .vscode/
 *.log
 trade_log.json
+processed/
+db/

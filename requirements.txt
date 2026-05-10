@@ -4,3 +4,6 @@ requests
 python-dotenv
 web3
 boto3
+duckdb
+numpy
+pandas
